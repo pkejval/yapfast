@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Build the working tree, including untracked files, and update the local install.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+build_dir=${YAPFAST_BUILD_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/yapfast-build}
+install_dir=$HOME/.local/opt/yapfast
+mkdir -p "$build_dir" "$install_dir"
+export TMPDIR="$build_dir"
+
+if [[ -x "$HOME/.local/bin/nix-portable" ]]; then
+    export NP_GIT=${NP_GIT:-/usr/bin/git}
+    export NP_RUNTIME=${NP_RUNTIME:-bwrap}
+    nix_command=("$HOME/.local/bin/nix-portable" nix)
+elif command -v nix >/dev/null 2>&1; then
+    nix_command=(nix)
+else
+    echo 'Requires nix or ~/.local/bin/nix-portable.' >&2
+    exit 1
+fi
+
+"${nix_command[@]}" --extra-experimental-features 'nix-command flakes' \
+    --option build-dir "$build_dir" \
+    build path:.#yapfast --out-link "$install_dir/result"
+
+echo "Built $install_dir/result/bin/yapfast. Restart Yapfast to use this build."

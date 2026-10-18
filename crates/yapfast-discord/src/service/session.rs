@@ -38,6 +38,7 @@ pub(super) struct Shared {
     pub(super) lists: MemberLists,
     /// The presence this session last sent, which it identifies with again.
     pub(super) presence: Value,
+    pub(super) activity: watch::Receiver<Option<Arc<Value>>>,
     /// Nobody has used Yapfast since then, in Unix milliseconds, and whether
     /// it may show idle; see [`settings::Away`].
     pub(super) inactive: Option<(u64, bool)>,
@@ -58,6 +59,7 @@ pub(super) async fn run(
         snapshots.send_modify(|snapshot| Arc::make_mut(snapshot).status = Status::Connecting);
         let connect = async {
             shared.api.learn_build_number().await;
+            crate::activity::merge(&mut shared.presence, shared.activity.borrow().as_deref());
             Gateway::connect(&token, shared.presence.clone(), &mut reconnects).await
         };
         let connected = tokio::select! {
@@ -289,6 +291,7 @@ impl Session<'_> {
                     self.publisher.changed();
                     self.show_presence().await
                 }
+                () = activity_changed(&mut self.shared.activity) => self.show_presence().await,
                 () = self.away_changes.as_mut(), if self.away_change.is_some() => {
                     self.show_presence().await
                 }
@@ -564,7 +567,11 @@ impl Session<'_> {
         self.away_changes
             .as_mut()
             .reset(Instant::now() + until(next));
-        let presence = self.tracker.own_presence(away);
+        let mut presence = self.tracker.own_presence(away);
+        crate::activity::merge(
+            &mut presence,
+            self.shared.activity.borrow_and_update().as_deref(),
+        );
         if presence != self.shared.presence {
             self.gateway.update_presence(presence.clone()).await?;
             self.shared.presence = presence;
@@ -578,6 +585,14 @@ impl Session<'_> {
             .as_mut()
             .reset(Instant::now() + status_left(&self.tracker));
     }
+}
+
+/// A stopped activity bridge must not spin the session loop.
+async fn activity_changed(activity: &mut watch::Receiver<Option<Arc<Value>>>) {
+    if activity.changed().await.is_ok() {
+        return;
+    }
+    std::future::pending::<()>().await;
 }
 
 impl Session<'_> {
