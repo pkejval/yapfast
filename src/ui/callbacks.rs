@@ -1040,11 +1040,100 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
         }
     });
     let state = adapter.clone();
+    window.on_choose_custom_icon(move || {
+        let weak = Rc::downgrade(&state);
+        state.borrow_mut().dialog(async move {
+            let file = rfd::AsyncFileDialog::new()
+                .set_title("Choose a custom Yapfast icon")
+                .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+                .pick_file()
+                .await;
+            let Some(file) = file else { return };
+            let pixels = match crate::icon::decode_custom(&file.read().await) {
+                Ok(pixels) => pixels,
+                Err(error) => {
+                    tracing::warn!(%error, "could not use the custom application icon");
+                    return;
+                }
+            };
+            let png = match crate::icon::encode_custom_png(&pixels) {
+                Ok(png) => png,
+                Err(error) => {
+                    tracing::warn!(%error, "could not save the custom application icon");
+                    return;
+                }
+            };
+            let Some(adapter) = weak.upgrade() else {
+                return;
+            };
+            let Some(window) = adapter.borrow().window.upgrade() else {
+                return;
+            };
+            let mut adapter = adapter.borrow_mut();
+            let path = adapter.root.join("custom-icon.png");
+            if let Err(error) =
+                std::fs::create_dir_all(&adapter.root).and_then(|()| std::fs::write(path, png))
+            {
+                tracing::warn!(%error, "could not store the custom application icon");
+                return;
+            }
+            let pixels = std::sync::Arc::new(pixels);
+            adapter.custom_icon = Some(pixels.clone());
+            adapter.layout.custom_icon = true;
+            adapter.layout.write(&adapter.root);
+            crate::icon::set_custom(&window.window(), &pixels);
+            window.set_has_custom_icon(true);
+            adapter.show_tray();
+        });
+    });
+    let state = adapter.clone();
+    let weak = window.as_weak();
+    window.on_reset_custom_icon(move || {
+        let Some(window) = weak.upgrade() else { return };
+        let mut adapter = state.borrow_mut();
+        adapter.custom_icon = None;
+        adapter.layout.custom_icon = false;
+        let path = adapter.root.join("custom-icon.png");
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "could not remove the custom application icon file");
+        }
+        adapter.layout.write(&adapter.root);
+        crate::icon::set_style(&window.window(), adapter.layout.icon_style.unwrap_or(0));
+        window.set_has_custom_icon(false);
+        adapter.show_tray();
+    });
+    let state = adapter.clone();
+    window.on_choose_tray_idle_icon(move || choose_tray_icon(state.clone(), false));
+    let state = adapter.clone();
+    window.on_choose_tray_speaking_icon(move || choose_tray_icon(state.clone(), true));
+    let state = adapter.clone();
+    let weak = window.as_weak();
+    window.on_reset_tray_idle_icon(move || {
+        if let Some(window) = weak.upgrade() {
+            reset_tray_icon(&state, &window, false);
+        }
+    });
+    let state = adapter.clone();
+    let weak = window.as_weak();
+    window.on_reset_tray_speaking_icon(move || {
+        if let Some(window) = weak.upgrade() {
+            reset_tray_icon(&state, &window, true);
+        }
+    });
+    let state = adapter.clone();
     let weak = window.as_weak();
     window.on_preferences_changed(move || {
         let Some(window) = weak.upgrade() else { return };
         let mut adapter = state.borrow_mut();
+        let has_custom_icon = adapter.custom_icon.is_some();
         let layout = &mut adapter.layout;
+        layout.tray_voice_activity = Some(window.get_tray_voice_activity());
+        layout.icon_style = Some(window.get_icon_style().clamp(0, 2));
+        if !has_custom_icon {
+            crate::icon::set_style(&window.window(), layout.icon_style.unwrap_or(0));
+        }
         layout.twelve_hour_clock = window.get_twelve_hour_clock();
         layout.clock_seconds = window.get_clock_seconds();
         layout.text_size = Some(window.get_text_size());
@@ -1076,6 +1165,7 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
         layout.gpu_rendering = window.get_gpu_rendering();
         layout.close_to_tray = Some(window.get_close_to_tray());
         adapter.layout.write(&adapter.root);
+        adapter.show_tray();
         let start = window.get_start_on_sign_in();
         if AUTOSTART.get() && start != autostart::enabled() {
             match autostart::set(start) {
@@ -2152,6 +2242,94 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
             }
         });
     }
+}
+
+/// Opens a picker for one tray voice state and stores its normalized image.
+fn choose_tray_icon(adapter: Rc<RefCell<Adapter>>, speaking: bool) {
+    let weak = Rc::downgrade(&adapter);
+    adapter.borrow_mut().dialog(async move {
+        let label = if speaking {
+            "Choose tray icon while speaking"
+        } else {
+            "Choose tray icon while not speaking"
+        };
+        let file = rfd::AsyncFileDialog::new()
+            .set_title(label)
+            .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+            .pick_file()
+            .await;
+        let Some(file) = file else { return };
+        let pixels = match crate::icon::decode_custom(&file.read().await) {
+            Ok(pixels) => pixels,
+            Err(error) => {
+                tracing::warn!(%error, "could not use the tray icon");
+                return;
+            }
+        };
+        let png = match crate::icon::encode_custom_png(&pixels) {
+            Ok(png) => png,
+            Err(error) => {
+                tracing::warn!(%error, "could not save the tray icon");
+                return;
+            }
+        };
+        let Some(adapter) = weak.upgrade() else {
+            return;
+        };
+        let Some(window) = adapter.borrow().window.upgrade() else {
+            return;
+        };
+        let mut adapter = adapter.borrow_mut();
+        let filename = if speaking {
+            "tray-speaking-icon.png"
+        } else {
+            "tray-idle-icon.png"
+        };
+        let path = adapter.root.join(filename);
+        if let Err(error) =
+            std::fs::create_dir_all(&adapter.root).and_then(|()| std::fs::write(path, png))
+        {
+            tracing::warn!(%error, "could not store the tray icon");
+            return;
+        }
+        let pixels = std::sync::Arc::new(pixels);
+        if speaking {
+            adapter.tray_speaking_icon = Some(pixels);
+            adapter.layout.tray_speaking_icon = true;
+            window.set_has_tray_speaking_icon(true);
+        } else {
+            adapter.tray_idle_icon = Some(pixels);
+            adapter.layout.tray_idle_icon = true;
+            window.set_has_tray_idle_icon(true);
+        }
+        adapter.layout.write(&adapter.root);
+        adapter.show_tray();
+    });
+}
+
+fn reset_tray_icon(adapter: &Rc<RefCell<Adapter>>, window: &YapfastWindow, speaking: bool) {
+    let mut adapter = adapter.borrow_mut();
+    let (filename, enabled) = if speaking {
+        adapter.tray_speaking_icon = None;
+        window.set_has_tray_speaking_icon(false);
+        (
+            "tray-speaking-icon.png",
+            &mut adapter.layout.tray_speaking_icon,
+        )
+    } else {
+        adapter.tray_idle_icon = None;
+        window.set_has_tray_idle_icon(false);
+        ("tray-idle-icon.png", &mut adapter.layout.tray_idle_icon)
+    };
+    *enabled = false;
+    let path = adapter.root.join(filename);
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(%error, "could not remove the tray icon file");
+    }
+    adapter.layout.write(&adapter.root);
+    adapter.show_tray();
 }
 
 #[cfg(feature = "discord")]
