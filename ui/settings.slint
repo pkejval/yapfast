@@ -548,6 +548,9 @@ export component AppearanceSettings inherits VerticalLayout {
     in property <bool> has-custom-icon;
     in property <bool> has-tray-idle-icon;
     in property <bool> has-tray-speaking-icon;
+    in property <image> app-icon-preview;
+    in property <image> tray-idle-icon-preview;
+    in property <image> tray-speaking-icon-preview;
     callback preferences-changed;
     callback choose-custom-icon();
     callback reset-custom-icon();
@@ -567,60 +570,80 @@ export component AppearanceSettings inherits VerticalLayout {
     spacing: 16px;
     SettingsTitle { text: "Appearance"; }
     VerticalLayout {
-        spacing: 8px;
+        spacing: 10px;
         SettingsHeading { text: "APPLICATION ICON"; }
+        HorizontalLayout {
+            spacing: 12px;
+            Rectangle {
+                width: 56px; height: 56px; border-radius: 12px;
+                background: Theme.raised; border-width: 1px; border-color: Theme.line;
+                Image { source: root.app-icon-preview; width: 40px; height: 40px; image-fit: contain; }
+            }
+            VerticalLayout {
+                alignment: center; spacing: 4px;
+                Label { text: root.has-custom-icon ? "Custom icon" : ["Marigold", "Blue", "Mint"][root.icon-style]; }
+                Label { text: "Window and default tray icon"; }
+            }
+            HorizontalLayout {
+                horizontal-stretch: 1; alignment: end; spacing: 8px;
+                ActionButton {
+                    text: root.has-custom-icon ? "Change" : "Choose image";
+                    icon: @image-url("icons/image.svg"); clicked => { root.choose-custom-icon(); }
+                }
+                if root.has-custom-icon: ActionButton {
+                    text: "Reset default"; ghost: true;
+                    clicked => { root.reset-custom-icon(); }
+                }
+            }
+        }
+        Label { text: "PNG, JPEG or WebP, up to 16 MB."; }
         Choices {
-            label: "Application icon"; options: ["Marigold", "Blue", "Mint"];
-            current <=> root.icon-style;
-            chosen => { root.preferences-changed(); }
+            label: "Default colour"; options: ["Marigold", "Blue", "Mint"];
+            current <=> root.icon-style; chosen => { root.preferences-changed(); }
         }
-        Label { text: "Changes the icon shown by the running window and in the system tray."; }
     }
     VerticalLayout {
         spacing: 8px;
-        SettingsHeading { text: "CUSTOM ICON FILE"; }
+        SettingsHeading { text: "TRAY ICONS"; }
+        Label { text: "Choose a separate image for each voice state. Without a custom image, the app icon is used."; }
         HorizontalLayout {
-            spacing: 8px;
-            ActionButton {
-                text: root.has-custom-icon ? "Choose another file" : "Choose image";
-                icon: @image-url("icons/image.svg");
-                clicked => { root.choose-custom-icon(); }
+            spacing: 12px;
+            Rectangle {
+                width: 48px; height: 48px; border-radius: 10px;
+                background: Theme.raised; border-width: 1px; border-color: Theme.line;
+                Image { source: root.tray-idle-icon-preview; width: 36px; height: 36px; image-fit: contain; }
             }
-            if root.has-custom-icon: ActionButton {
-                text: "Use selected colours"; ghost: true;
-                clicked => { root.reset-custom-icon(); }
+            VerticalLayout { alignment: center; spacing: 4px; horizontal-stretch: 1;
+                Label { text: "Not speaking"; }
+                Label { text: root.has-tray-idle-icon ? "Custom tray icon" : "Using application icon"; }
             }
-        }
-        Label { text: "PNG, JPEG or WebP, up to 16 MB. The image is copied into Yapfast's settings."; }
-    }
-    VerticalLayout {
-        spacing: 8px;
-        SettingsHeading { text: "TRAY ICON WHILE NOT SPEAKING"; }
-        HorizontalLayout {
-            spacing: 8px;
             ActionButton {
-                text: root.has-tray-idle-icon ? "Choose another file" : "Choose image";
+                text: root.has-tray-idle-icon ? "Change" : "Choose image";
                 icon: @image-url("icons/image.svg"); clicked => { root.choose-tray-idle-icon(); }
             }
             if root.has-tray-idle-icon: ActionButton {
-                text: "Reset"; ghost: true; clicked => { root.reset-tray-idle-icon(); }
+                text: "Reset default"; ghost: true; clicked => { root.reset-tray-idle-icon(); }
             }
         }
-    }
-    VerticalLayout {
-        spacing: 8px;
-        SettingsHeading { text: "TRAY ICON WHILE SPEAKING"; }
         HorizontalLayout {
-            spacing: 8px;
+            spacing: 12px;
+            Rectangle {
+                width: 48px; height: 48px; border-radius: 10px;
+                background: Theme.raised; border-width: 1px; border-color: Theme.line;
+                Image { source: root.tray-speaking-icon-preview; width: 36px; height: 36px; image-fit: contain; }
+            }
+            VerticalLayout { alignment: center; spacing: 4px; horizontal-stretch: 1;
+                Label { text: "Speaking"; }
+                Label { text: root.has-tray-speaking-icon ? "Custom tray icon" : "Using application icon"; }
+            }
             ActionButton {
-                text: root.has-tray-speaking-icon ? "Choose another file" : "Choose image";
+                text: root.has-tray-speaking-icon ? "Change" : "Choose image";
                 icon: @image-url("icons/image.svg"); clicked => { root.choose-tray-speaking-icon(); }
             }
             if root.has-tray-speaking-icon: ActionButton {
-                text: "Reset"; ghost: true; clicked => { root.reset-tray-speaking-icon(); }
+                text: "Reset default"; ghost: true; clicked => { root.reset-tray-speaking-icon(); }
             }
         }
-        Label { text: "Both tray images can be different from the window icon."; }
     }
     SettingsSwitch {
         text: "Show when I'm speaking in the tray";

@@ -820,6 +820,9 @@ export component YapfastWindow inherits Window {
     in property <bool> has-custom-icon;
     in property <bool> has-tray-idle-icon;
     in property <bool> has-tray-speaking-icon;
+    in property <image> app-icon-preview;
+    in property <image> tray-idle-icon-preview;
+    in property <image> tray-speaking-icon-preview;
     callback new-theme();
     callback edit-theme(string);
     callback theme-start-chosen(int);
@@ -2813,6 +2816,9 @@ export component YapfastWindow inherits Window {
             has-custom-icon: root.has-custom-icon;
             has-tray-idle-icon: root.has-tray-idle-icon;
             has-tray-speaking-icon: root.has-tray-speaking-icon;
+            app-icon-preview: root.app-icon-preview;
+            tray-idle-icon-preview: root.tray-idle-icon-preview;
+            tray-speaking-icon-preview: root.tray-speaking-icon-preview;
             editor: root.theme-editor; colours: root.theme-colours;
             theme-name <=> root.theme-name; theme-dark <=> root.theme-dark;
             editing-saved: root.theme-editing-saved; starts: root.theme-starts; start-index: root.theme-start;

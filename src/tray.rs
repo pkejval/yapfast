@@ -121,6 +121,20 @@ fn logo(
         .to_rgba8()
 }
 
+/// Makes a small settings preview using the same image and voice indicator as the tray.
+pub fn preview(style: u8, speaking: bool, pixels: Option<&[u8]>) -> slint::Image {
+    let image = pixels
+        .filter(|pixels| pixels.len() == 64 * 64 * 4)
+        .map(|pixels| custom_with_status(pixels, false, speaking))
+        .and_then(|pixels| {
+            Some(slint::Image::from_rgba8(
+                slint::SharedPixelBuffer::clone_from_slice(&pixels, 64, 64),
+            ))
+        })
+        .or_else(|| logo(64, false, speaking, style).map(slint::Image::from_rgba8));
+    image.unwrap_or_default()
+}
+
 /// Keeps unread and speaking states visible when a custom base icon is in use.
 fn custom_with_status(pixels: &[u8], unread: bool, speaking: bool) -> Vec<u8> {
     let mut output = pixels.to_vec();

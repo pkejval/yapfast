@@ -1087,6 +1087,7 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
             adapter.layout.write(&adapter.root);
             crate::icon::set_custom(&window.window(), &pixels);
             window.set_has_custom_icon(true);
+            refresh_icon_previews(&adapter, &window);
             adapter.show_tray();
         });
     });
@@ -1106,6 +1107,7 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
         adapter.layout.write(&adapter.root);
         crate::icon::set_style(&window.window(), adapter.layout.icon_style.unwrap_or(0));
         window.set_has_custom_icon(false);
+        refresh_icon_previews(&adapter, &window);
         adapter.show_tray();
     });
     let state = adapter.clone();
@@ -1132,12 +1134,13 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
         let Some(window) = weak.upgrade() else { return };
         let mut adapter = state.borrow_mut();
         let has_custom_icon = adapter.custom_icon.is_some();
-        let layout = &mut adapter.layout;
-        layout.tray_voice_activity = Some(window.get_tray_voice_activity());
-        layout.icon_style = Some(window.get_icon_style().clamp(0, 2));
+        adapter.layout.tray_voice_activity = Some(window.get_tray_voice_activity());
+        adapter.layout.icon_style = Some(window.get_icon_style().clamp(0, 2));
         if !has_custom_icon {
-            crate::icon::set_style(&window.window(), layout.icon_style.unwrap_or(0));
+            crate::icon::set_style(&window.window(), adapter.layout.icon_style.unwrap_or(0));
         }
+        refresh_icon_previews(&adapter, &window);
+        let layout = &mut adapter.layout;
         layout.twelve_hour_clock = window.get_twelve_hour_clock();
         layout.clock_seconds = window.get_clock_seconds();
         layout.text_size = Some(window.get_text_size());
@@ -2312,6 +2315,7 @@ fn choose_tray_icon(adapter: Rc<RefCell<Adapter>>, speaking: bool) {
             window.set_has_tray_idle_icon(true);
         }
         adapter.layout.write(&adapter.root);
+        refresh_icon_previews(&adapter, &window);
         adapter.show_tray();
     });
 }
@@ -2338,7 +2342,27 @@ fn reset_tray_icon(adapter: &Rc<RefCell<Adapter>>, window: &YapfastWindow, speak
         tracing::warn!(%error, "could not remove the tray icon file");
     }
     adapter.layout.write(&adapter.root);
+    refresh_icon_previews(&adapter, window);
     adapter.show_tray();
+}
+
+/// Updates the previews to match the images used by the window and tray.
+fn refresh_icon_previews(adapter: &Adapter, window: &YapfastWindow) {
+    let style = adapter.layout.icon_style.unwrap_or(0).clamp(0, 2) as u8;
+    let app = adapter.custom_icon.as_deref().map(Vec::as_slice);
+    let idle = adapter
+        .tray_idle_icon
+        .as_deref()
+        .map(Vec::as_slice)
+        .or(app);
+    let speaking = adapter
+        .tray_speaking_icon
+        .as_deref()
+        .map(Vec::as_slice)
+        .or(idle);
+    window.set_app_icon_preview(crate::tray::preview(style, false, app));
+    window.set_tray_idle_icon_preview(crate::tray::preview(style, false, idle));
+    window.set_tray_speaking_icon_preview(crate::tray::preview(style, true, speaking));
 }
 
 #[cfg(feature = "discord")]
