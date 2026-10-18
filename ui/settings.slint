@@ -543,6 +543,18 @@ export component AppearanceSettings inherits VerticalLayout {
     in property <[string]> starts;
     in property <int> start-index;
     in property <bool> can-save;
+    in-out property <bool> tray-voice-activity: true;
+    in-out property <int> icon-style: 0;
+    in property <bool> has-custom-icon;
+    in property <bool> has-tray-idle-icon;
+    in property <bool> has-tray-speaking-icon;
+    callback preferences-changed;
+    callback choose-custom-icon();
+    callback reset-custom-icon();
+    callback choose-tray-idle-icon();
+    callback reset-tray-idle-icon();
+    callback choose-tray-speaking-icon();
+    callback reset-tray-speaking-icon();
     callback choose-theme(string);
     callback new-theme();
     callback edit-theme(string);
@@ -554,6 +566,68 @@ export component AppearanceSettings inherits VerticalLayout {
     callback delete-theme();
     spacing: 16px;
     SettingsTitle { text: "Appearance"; }
+    VerticalLayout {
+        spacing: 8px;
+        SettingsHeading { text: "APPLICATION ICON"; }
+        Choices {
+            label: "Application icon"; options: ["Marigold", "Blue", "Mint"];
+            current <=> root.icon-style;
+            chosen => { root.preferences-changed(); }
+        }
+        Label { text: "Changes the icon shown by the running window and in the system tray."; }
+    }
+    VerticalLayout {
+        spacing: 8px;
+        SettingsHeading { text: "CUSTOM ICON FILE"; }
+        HorizontalLayout {
+            spacing: 8px;
+            ActionButton {
+                text: root.has-custom-icon ? "Choose another file" : "Choose image";
+                icon: @image-url("icons/image.svg");
+                clicked => { root.choose-custom-icon(); }
+            }
+            if root.has-custom-icon: ActionButton {
+                text: "Use selected colours"; ghost: true;
+                clicked => { root.reset-custom-icon(); }
+            }
+        }
+        Label { text: "PNG, JPEG or WebP, up to 16 MB. The image is copied into Yapfast's settings."; }
+    }
+    VerticalLayout {
+        spacing: 8px;
+        SettingsHeading { text: "TRAY ICON WHILE NOT SPEAKING"; }
+        HorizontalLayout {
+            spacing: 8px;
+            ActionButton {
+                text: root.has-tray-idle-icon ? "Choose another file" : "Choose image";
+                icon: @image-url("icons/image.svg"); clicked => { root.choose-tray-idle-icon(); }
+            }
+            if root.has-tray-idle-icon: ActionButton {
+                text: "Reset"; ghost: true; clicked => { root.reset-tray-idle-icon(); }
+            }
+        }
+    }
+    VerticalLayout {
+        spacing: 8px;
+        SettingsHeading { text: "TRAY ICON WHILE SPEAKING"; }
+        HorizontalLayout {
+            spacing: 8px;
+            ActionButton {
+                text: root.has-tray-speaking-icon ? "Choose another file" : "Choose image";
+                icon: @image-url("icons/image.svg"); clicked => { root.choose-tray-speaking-icon(); }
+            }
+            if root.has-tray-speaking-icon: ActionButton {
+                text: "Reset"; ghost: true; clicked => { root.reset-tray-speaking-icon(); }
+            }
+        }
+        Label { text: "Both tray images can be different from the window icon."; }
+    }
+    SettingsSwitch {
+        text: "Show when I'm speaking in the tray";
+        description: "Adds a green mark to the tray icon while your microphone is sending voice.";
+        checked <=> root.tray-voice-activity;
+        toggled => { root.preferences-changed(); }
+    }
     if !root.editor: VerticalLayout {
         spacing: 8px;
         HorizontalLayout {
