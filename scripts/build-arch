@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Package the current working tree for Arch/CachyOS, including untracked files.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+project_dir=$PWD
+build_dir=${YAPFAST_ARCH_BUILD_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/yapfast-arch}
+mkdir -p "$build_dir/tmp"
+build_dir=$(realpath "$build_dir")
+case "$build_dir/" in
+    "$project_dir/"*) echo 'Choose a build directory outside the repository.' >&2; exit 1 ;;
+esac
+command -v makepkg >/dev/null || { echo 'Install base-devel first: sudo pacman -S --needed base-devel' >&2; exit 1; }
+export TMPDIR="$build_dir/tmp"
+# Reuse build outputs between runs, without including them in the source archive.
+tar -czf "$build_dir/yapfast-src.tar.gz" \
+    --transform='s,^,yapfast/,' \
+    Cargo.toml Cargo.lock rust-toolchain.toml build.rs .cargo \
+    src crates ui vendor packaging nix LICENSE
+cp packaging/arch/PKGBUILD "$build_dir/PKGBUILD"
+cd "$build_dir"
+makepkg --syncdeps --force "$@"
+echo "makepkg finished; output directory: $build_dir"
+echo "If the old launcher is still installed, start this package with /usr/bin/yapfast."

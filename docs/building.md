@@ -23,6 +23,34 @@ It also builds the AppDir that the [AppImage](#linux-appimage) is packed from.
 in `outputHashes`. Moving a Git dependency to another commit needs a new
 hash there; a `nix build` with the old one prints it.
 
+### Arch Linux / CachyOS package (without Nix)
+
+Install `base-devel`, then run `scripts/build-arch --install` from the checkout.
+The script snapshots the current source, including untracked source files, and
+uses `makepkg` to install missing dependencies, build a Discord-only native
+package and install it through pacman. Without `--install`, it only creates
+the `.pkg.tar.zst` package. Sources and build outputs are kept under
+`~/.cache/yapfast-arch`; override this with `YAPFAST_ARCH_BUILD_DIR`.
+
+This build uses the distribution's Rust (at least 1.97.1), Clang and LLVM,
+plus checksum-verified upstream Skia and WebRTC archives. The Skia preparation
+verifies that its JPEG symbol rename preserves native code and data.
+
+The package installs `/usr/bin/yapfast`. An older `~/.local/bin/yapfast` launcher
+can take precedence in your shell; run `/usr/bin/yapfast` explicitly until you
+remove that old launcher. An existing desktop entry in `~/.local/share/applications`
+can likewise override the packaged entry.
+
+### Updating an existing local installation
+
+Run `scripts/build-local` to build the current working tree, including untracked
+files, and update `~/.local/opt/yapfast/result`. It uses
+`~/.local/bin/nix-portable` when available, otherwise `nix`. The existing local
+launcher picks up the new build after restarting Yapfast.
+
+Builds use `~/.cache/yapfast-build` instead of `/tmp`; set `YAPFAST_BUILD_DIR`
+to choose another directory on disk.
+
 ## Dependencies
 
 Yapfast pins Rust 1.97.1, Slint 1.18.1 and Skia 0.153.3. Cargo.lock pins

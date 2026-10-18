@@ -1,0 +1,51 @@
+# Local working-tree source archive is created by scripts/build-arch.
+pkgname=yapfast
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Native Discord client built with Rust and Slint'
+arch=('x86_64')
+url='https://yapfast.com'
+license=('GPL-3.0-or-later')
+depends=(glibc gcc-libs alsa-lib libpulse fontconfig freetype2 glib2 libxkbcommon openssl
+         wayland vulkan-icd-loader libglvnd libx11 libxcursor libxi libxrandr
+         libxcb pipewire libdrm mesa libxfixes libxdamage libxcomposite libxext)
+makedepends=('rust>=1.97.1' clang llvm cmake ninja protobuf pkgconf python curl unzip)
+optdepends=('xdg-desktop-portal: file dialogs and screen sharing'
+            'org.freedesktop.secrets: store login credentials')
+options=('!lto' '!debug')
+_skia=skia-binaries-b7f043e0b1e2a850e702-x86_64-unknown-linux-gnu-ganesh-gl-jpegd-jpege-pdf-vulkan.tar.gz
+source=('yapfast-src.tar.gz'
+        'webrtc-linux-x64-release.zip::https://github.com/livekit/rust-sdks/releases/download/webrtc-51ef663/webrtc-linux-x64-release.zip'
+        "https://github.com/rust-skia/skia-binaries/releases/download/0.153.3/$_skia")
+noextract=('webrtc-linux-x64-release.zip' "$_skia")
+sha256sums=('SKIP'
+            'dce9d9414cd8e2cc9a471c054481851b257ad2a879112ce5be56369b4fefdaed'
+            '9ebe4c448cc9f789bad241cbd11739cdf759e27db5719c23a7635e096d5807b3')
+
+prepare() {
+    cd "$srcdir/yapfast"
+    unzip -qo "$srcdir/webrtc-linux-x64-release.zip" -d "$srcdir/webrtc"
+    YAPFAST_SKIA_SOURCE="$srcdir/$_skia" \
+    YAPFAST_SKIA_OUTPUT="$srcdir/skia" \
+        python nix/prepare-skia-native.py
+    /usr/bin/cargo fetch --locked --target x86_64-unknown-linux-gnu
+}
+
+build() {
+    cd "$srcdir/yapfast"
+    export CC=clang CXX=clang++ RUSTC=/usr/bin/rustc
+    export LK_CUSTOM_WEBRTC="$srcdir/webrtc/linux-x64-release"
+    export SKIA_BINARIES_URL="file://$srcdir/skia/$_skia"
+    export CARGO_TARGET_DIR="$srcdir/target"
+    /usr/bin/cargo build --frozen --release --bin yapfast \
+        --no-default-features --features desktop,discord
+}
+
+package() {
+    cd "$srcdir/yapfast"
+    install -Dm755 "$srcdir/target/release/yapfast" "$pkgdir/usr/bin/yapfast"
+    local id=io.github.yapfast.Yapfast
+    install -Dm644 packaging/icon.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/$id.svg"
+    install -Dm644 "packaging/linux/$id.desktop" "$pkgdir/usr/share/applications/$id.desktop"
+    install -Dm644 "packaging/linux/$id.metainfo.xml" "$pkgdir/usr/share/metainfo/$id.metainfo.xml"
+}
