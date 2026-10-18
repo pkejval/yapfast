@@ -33,9 +33,13 @@ stamp_path = target / 'yapfast-skia-native.json'
 script_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 objcopy = os.environ.get('YAPFAST_SKIA_OBJCOPY') or shutil.which('llvm-objcopy')
 if not objcopy:
-    raise SystemExit('Pinned development shell must provide LLVM objcopy')
+    raise SystemExit('Install LLVM objcopy or set YAPFAST_SKIA_OBJCOPY')
 objcopy_version = subprocess.check_output([objcopy, '--version'], text=True).strip()
-if 'LLVM version 21.1.7\n' not in objcopy_version:
+if 'LLVM version ' not in objcopy_version:
+    raise SystemExit('Expected LLVM objcopy: ' + objcopy_version)
+# ELF transformations below are verified section by section; native Linux
+# packages can use the distribution's LLVM. Keep the Windows toolchain pinned.
+if native_target == 'windows' and 'LLVM version 21.1.7\n' not in objcopy_version:
     raise SystemExit('Unexpected objcopy version: ' + objcopy_version)
 stamp = {
     'tag': '0.153.3', 'key': key, 'upstream_sha256': source_sha256,
