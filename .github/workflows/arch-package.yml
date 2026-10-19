@@ -30,12 +30,45 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Prepare cache paths
+        run: |
+          mkdir -p /home/builder/.cargo/registry /home/builder/.cargo/git
+          mkdir -p "$RUNNER_TEMP/yapfast-arch/src/target" /var/cache/pacman/pkg
+
+      - name: Set cache period
+        id: cache-period
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Arch packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/pacman/pkg
+          key: arch-packages-${{ runner.os }}-${{ steps.cache-period.outputs.week }}
+          restore-keys: arch-packages-${{ runner.os }}-
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            /home/builder/.cargo/registry
+            /home/builder/.cargo/git
+          key: rust-deps-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ steps.cache-period.outputs.week }}
+          restore-keys: rust-deps-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
+
+      - name: Cache Rust compilation
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/yapfast-arch/src/target
+          key: rust-target-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'packaging/arch/PKGBUILD') }}-${{ steps.cache-period.outputs.week }}
+          restore-keys: rust-target-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'packaging/arch/PKGBUILD') }}-
+
       - name: Build package
         run: |
           useradd --create-home builder
           printf 'builder ALL=(ALL:ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/builder
           chmod 0440 /etc/sudoers.d/builder
           install -d -o builder -g builder "$RUNNER_TEMP/yapfast-arch"
+          chown -R builder:builder /home/builder/.cargo "$RUNNER_TEMP/yapfast-arch"
           chown -R builder:builder "$GITHUB_WORKSPACE"
           runuser -u builder -- env \
             YAPFAST_ARCH_BUILD_DIR="$RUNNER_TEMP/yapfast-arch" \

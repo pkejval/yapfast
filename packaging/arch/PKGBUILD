@@ -36,7 +36,7 @@ build() {
     export CC=clang CXX=clang++ RUSTC=/usr/bin/rustc
     export LK_CUSTOM_WEBRTC="$srcdir/webrtc/linux-x64-release"
     export SKIA_BINARIES_URL="file://$srcdir/skia/$_skia"
-    export CARGO_TARGET_DIR="$srcdir/target"
+    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$srcdir/target}"
     /usr/bin/cargo build --frozen --release --bin yapfast \
         --no-default-features --features desktop,discord
 }

@@ -15,6 +15,7 @@ pub mod embed;
 pub mod event;
 pub mod forum;
 pub mod frecency;
+pub mod game_detection;
 pub mod gateway;
 pub mod gifs;
 pub mod limits;
@@ -35,3 +36,5 @@ pub mod token;
 pub mod unread;
 pub mod voice;
 mod voice_connection;
+#[cfg(target_os = "linux")]
+mod rpc;
