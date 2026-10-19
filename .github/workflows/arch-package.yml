@@ -1,0 +1,50 @@
+name: Arch package
+
+on:
+  push:
+    branches:
+      - build/all-changes
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arch-package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build x86_64 Arch package
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:base-devel
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Prepare container for GitHub Actions
+        run: pacman -Syu --noconfirm --needed git nodejs sudo
+
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build package
+        run: |
+          useradd --create-home builder
+          printf 'builder ALL=(ALL:ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/builder
+          chmod 0440 /etc/sudoers.d/builder
+          install -d -o builder -g builder "$RUNNER_TEMP/yapfast-arch"
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          runuser -u builder -- env \
+            YAPFAST_ARCH_BUILD_DIR="$RUNNER_TEMP/yapfast-arch" \
+            "$GITHUB_WORKSPACE/scripts/build-arch"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: yapfast-arch-x86_64-${{ github.sha }}
+          path: ${{ runner.temp }}/yapfast-arch/*.pkg.tar.zst
+          if-no-files-found: error
+          retention-days: 30
