@@ -39,7 +39,7 @@ jobs:
           chown -R builder:builder "$GITHUB_WORKSPACE"
           runuser -u builder -- env \
             YAPFAST_ARCH_BUILD_DIR="$RUNNER_TEMP/yapfast-arch" \
-            "$GITHUB_WORKSPACE/scripts/build-arch"
+            "$GITHUB_WORKSPACE/scripts/build-arch" --noconfirm
 
       - name: Upload package
         uses: actions/upload-artifact@v7
