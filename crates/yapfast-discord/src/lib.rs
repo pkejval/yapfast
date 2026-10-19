@@ -38,3 +38,8 @@ pub mod voice;
 mod voice_connection;
 #[cfg(target_os = "linux")]
 mod rpc;
+
+/// The current detected game activity and its start time in Unix milliseconds.
+pub fn current_game_activity() -> Option<(String, Option<u64>)> {
+    activity::current()
+}

@@ -185,6 +185,8 @@ export component YapfastWindow inherits Window {
     /// The account is speaking in the call, unmuted, as its own row there shows.
     in property <bool> account-speaking;
     in property <string> account-status;
+    in property <string> game-activity-name;
+    in property <string> game-activity-duration;
     /// The address of the picture of the custom emoji in the account's status.
     in property <string> account-status-emoji;
     in property <string> storage;
@@ -262,6 +264,11 @@ export component YapfastWindow inherits Window {
     callback sync-discord-reads-toggled(bool);
     in-out property <bool> show-idle: true;
     callback show-idle-toggled(bool);
+    in-out property <bool> game-activity-enabled: true;
+    in property <[GameExecutable]> game-executables;
+    callback game-activity-toggled(bool);
+    callback save-game-executable(int, string, string) -> bool;
+    callback remove-game-executable(int);
     in-out property <bool> hide-blocked;
     callback hide-blocked-toggled(bool);
     in property <bool> room-selected;
@@ -876,6 +883,20 @@ export component YapfastWindow inherits Window {
     in property <[string]> theme-starts;
     in property <int> theme-start;
     in property <bool> theme-can-save;
+    callback choose-custom-icon();
+    callback reset-custom-icon();
+    callback choose-tray-idle-icon();
+    callback reset-tray-idle-icon();
+    callback choose-tray-speaking-icon();
+    callback reset-tray-speaking-icon();
+    in-out property <bool> tray-voice-activity: true;
+    in-out property <int> icon-style: 0;
+    in property <bool> has-custom-icon;
+    in property <bool> has-tray-idle-icon;
+    in property <bool> has-tray-speaking-icon;
+    in property <image> app-icon-preview;
+    in property <image> tray-idle-icon-preview;
+    in property <image> tray-speaking-icon-preview;
     callback new-theme();
     callback edit-theme(string);
     callback theme-start-chosen(int);
@@ -1418,6 +1439,7 @@ export component YapfastWindow inherits Window {
         close-policy: PopupClosePolicy.close-on-click-outside;
         status-menu-content := StatusMenu {
             status: root.discord-status; has-custom-status: root.has-custom-status;
+            game-name: root.game-activity-name; game-duration: root.game-activity-duration;
             choose(status) => { root.set-status(status); status-menu.close(); }
             custom-status => { root.open-status(); status-menu.close(); }
         }
@@ -2903,11 +2925,26 @@ export component YapfastWindow inherits Window {
         }
         if root.settings-section == 7: AppearanceSettings {
             themes: root.themes; theme-id: root.theme-id;
+            tray-voice-activity <=> root.tray-voice-activity;
+            icon-style <=> root.icon-style;
+            has-custom-icon: root.has-custom-icon;
+            has-tray-idle-icon: root.has-tray-idle-icon;
+            has-tray-speaking-icon: root.has-tray-speaking-icon;
+            app-icon-preview: root.app-icon-preview;
+            tray-idle-icon-preview: root.tray-idle-icon-preview;
+            tray-speaking-icon-preview: root.tray-speaking-icon-preview;
             editor: root.theme-editor; colours: root.theme-colours;
             theme-name <=> root.theme-name; theme-dark <=> root.theme-dark;
             editing-saved: root.theme-editing-saved; starts: root.theme-starts; start-index: root.theme-start;
             can-save: root.theme-can-save;
             choose-theme(id) => { root.choose-theme(id); }
+            preferences-changed => { root.preferences-changed(); }
+            choose-custom-icon => { root.choose-custom-icon(); }
+            reset-custom-icon => { root.reset-custom-icon(); }
+            choose-tray-idle-icon => { root.choose-tray-idle-icon(); }
+            reset-tray-idle-icon => { root.reset-tray-idle-icon(); }
+            choose-tray-speaking-icon => { root.choose-tray-speaking-icon(); }
+            reset-tray-speaking-icon => { root.reset-tray-speaking-icon(); }
             new-theme => { root.new-theme(); }
             edit-theme(id) => { root.edit-theme(id); }
             start-chosen(index) => { root.theme-start-chosen(index); }
@@ -2962,6 +2999,12 @@ export component YapfastWindow inherits Window {
             start-on-sign-in <=> root.start-on-sign-in; autostart-available: root.autostart-available;
             preferences-changed => { root.preferences-changed(); }
             restart => { root.restart(); }
+        }
+        if root.settings-section == 8: GameActivitySettings {
+            enabled: root.game-activity-enabled; executables: root.game-executables;
+            toggled(enabled) => { root.game-activity-toggled(enabled); }
+            save(index, executable, text) => { return root.save-game-executable(index, executable, text); }
+            remove(index) => { root.remove-game-executable(index); }
         }
         if root.settings-section == 4 && !root.discord-linked: DiscordLinkSettings {
             link-phase: root.link-phase; link-code: root.link-code; link-name: root.link-name; link-note: root.link-note;
