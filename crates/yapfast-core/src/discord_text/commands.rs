@@ -27,6 +27,10 @@ pub fn command(
         aside(room, discord, channels, done, events);
         return;
     }
+    if let Command::SendPoll { room, poll } = command {
+        send_poll(discord, room, poll, events);
+        return;
+    }
     if let Command::MarkRead { room, sync } = &command {
         if let (Ok(discord), Some((guild, channel))) = (discord, discord::parse_room(room)) {
             discord.mark_read(guild, channel, *sync);
@@ -77,6 +81,9 @@ pub fn command(
         | Command::Edit { room, .. }
         | Command::React { room, .. }
         | Command::Reactors { room, .. }
+        | Command::Vote { room, .. }
+        | Command::EndPoll { room, .. }
+        | Command::Voters { room, .. }
         | Command::RemoveReactor { room, .. }
         | Command::Delete { room, .. }
         | Command::Pin { room, .. }
@@ -227,6 +234,15 @@ pub fn command(
             limit,
             ..
         } => channel.reactors(discord, events, item, key, after, limit),
+        Command::Vote { item, answers, .. } => channel.vote(discord, done, &item, answers),
+        Command::EndPoll { item, .. } => channel.end_poll(discord, done, &item),
+        Command::Voters {
+            item,
+            answer,
+            after,
+            limit,
+            ..
+        } => channel.voters(discord, events, item, answer, after, limit),
         Command::RemoveReactor {
             item, key, user, ..
         } => channel.remove_reactor(discord, done, &item, &key, user),
@@ -664,6 +680,55 @@ pub fn live(
 /// Forwards a Discord message to another Discord conversation, as Discord's
 /// client does, then sends `note` there. Discord turns down a forward
 /// between networks.
+/// Posts a poll in a Discord conversation, as [`Event::PollPosted`] says.
+fn send_poll(
+    discord: Result<&Discord, &str>,
+    room: String,
+    poll: crate::chat::NewPoll,
+    events: &UnboundedSender<Event>,
+) {
+    let place =
+        discord::parse_room(&room).map(|(guild, channel)| [guild, channel].map(str::to_owned));
+    let (discord, Some([guild, channel])) = (discord, place) else {
+        let _ = events.send(Event::PollPosted {
+            room,
+            result: Err(NOT_DISCORD.into()),
+        });
+        return;
+    };
+    let discord = match discord {
+        Ok(discord) => discord.clone(),
+        Err(why) => {
+            let _ = events.send(Event::PollPosted {
+                room,
+                result: Err(why.into()),
+            });
+            return;
+        }
+    };
+    let poll = yapfast_discord::api::NewPoll {
+        question: poll.question,
+        answers: poll
+            .answers
+            .into_iter()
+            .map(|answer| yapfast_discord::api::NewAnswer {
+                text: answer.text,
+                emoji: answer.emoji,
+            })
+            .collect(),
+        hours: poll.hours,
+        multiselect: poll.multiselect,
+    };
+    let events = events.clone();
+    tokio::spawn(async move {
+        let result = discord
+            .send_poll(&guild, &channel, &poll)
+            .await
+            .map_err(|error| format!("Couldn't post the poll: {error}"));
+        let _ = events.send(Event::PollPosted { room, result });
+    });
+}
+
 fn forward(
     discord: Result<&Discord, &str>,
     room: &str,

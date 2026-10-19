@@ -9,11 +9,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::{
+    activity,
     api::{self, Api, PAGE, Span},
     cache, forum, limits,
     member_list::{ListedMember, Presence},
@@ -120,6 +121,8 @@ pub struct Conversation {
     pub presence: Option<Presence>,
     #[serde(skip)]
     pub activity: Option<String>,
+    #[serde(skip)]
+    pub activities: crate::activity::Activities,
     /// A message request's latest message, as the requests list shows it.
     #[serde(default)]
     pub preview: Option<Preview>,
@@ -164,6 +167,8 @@ pub struct Friend {
     pub presence: Option<Presence>,
     #[serde(skip)]
     pub activity: Option<String>,
+    #[serde(skip)]
+    pub activities: crate::activity::Activities,
 }
 
 /// Someone this account can start a DM with.
@@ -325,6 +330,14 @@ pub enum Live {
         message: String,
         key: String,
         emoji: String,
+        me: bool,
+        added: bool,
+    },
+    /// Someone voted for an answer of a poll, or took their vote back.
+    Vote {
+        channel: String,
+        message: String,
+        answer: u64,
         me: bool,
         added: bool,
     },
@@ -524,6 +537,9 @@ pub struct Discord {
     listed_threads: Arc<Mutex<HashMap<String, Value>>>,
     /// New DMs started lately, which Discord limits; see [`Self::dm_with`].
     new_dms: Arc<Mutex<limits::Window>>,
+    /// The addresses of the icons of applications activities showed, by
+    /// id; none for one without an icon.
+    application_icons: Arc<Mutex<HashMap<String, Option<String>>>>,
 }
 
 /// Discord allows starting 10 new DMs with people in 10 minutes, and treats
@@ -600,6 +616,7 @@ impl Discord {
             profiles: Arc::default(),
             listed_threads: Arc::default(),
             new_dms: Arc::new(Mutex::new(limits::Window::new(NEW_DMS, NEW_DM_SPAN))),
+            application_icons: Arc::default(),
         })
     }
 
@@ -699,9 +716,8 @@ impl Discord {
     }
 
     /// Who reacted to the message `id` with `emoji`, in the API's form: up
-    /// to `limit`, by user id, after the user `after`. In a server, the
-    /// nicknames and avatars of those not known there are asked for first,
-    /// waiting a while for them.
+    /// to `limit`, by user id, after the user `after`, named as
+    /// [`Self::people`] names them.
     pub async fn reactors(
         &self,
         guild: &str,
@@ -712,10 +728,42 @@ impl Discord {
         limit: u32,
     ) -> Result<Vec<Reactor>> {
         let users = self.api.reactors(channel, id, emoji, after, limit).await?;
+        Ok(self.people(guild, &users).await)
+    }
+
+    /// Who voted for `answer` of the poll of the message `id`, as
+    /// [`Self::reactors`] lists who reacted.
+    pub async fn voters(
+        &self,
+        guild: &str,
+        channel: &str,
+        id: &str,
+        answer: u64,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Reactor>> {
+        let users = self.api.voters(channel, id, answer, after, limit).await?;
+        Ok(self.people(guild, &users).await)
+    }
+
+    /// Votes for `answers` of a message's poll; none takes the vote back.
+    pub async fn vote(&self, channel: &str, id: &str, answers: &[u64]) -> Result<()> {
+        self.api.vote(channel, id, answers).await
+    }
+
+    /// Closes this account's poll now.
+    pub async fn end_poll(&self, channel: &str, id: &str) -> Result<()> {
+        self.api.end_poll(channel, id).await
+    }
+
+    /// Users as a list of people shows them, by their names in `guild`. In
+    /// a server, the nicknames and avatars of those not known there are
+    /// asked for first, waiting a while for them.
+    async fn people(&self, guild: &str, users: &[serde_json::Value]) -> Vec<Reactor> {
         let in_server = server(guild);
         let unknown: Vec<String> = {
             let mut names = self.write_names();
-            for user in &users {
+            for user in users {
                 names.learn_user(user);
             }
             users
@@ -736,7 +784,7 @@ impl Discord {
         }
         let me = self.snapshots.borrow().user_id.clone();
         let names = self.read_names();
-        Ok(users
+        users
             .iter()
             .filter_map(|user| {
                 let id = user["id"].as_str()?;
@@ -752,7 +800,7 @@ impl Discord {
                     me: me.as_deref() == Some(id),
                 })
             })
-            .collect())
+            .collect()
     }
 
     /// A channel's pinned messages, the latest pinned first: a server's
@@ -891,30 +939,98 @@ impl Discord {
         options: crate::api::Sending<'_>,
         files: Vec<(String, Vec<u8>)>,
     ) -> Result<Message> {
-        let mut uploads = Vec::with_capacity(files.len());
-        for (name, data) in files {
-            match self.api.upload(channel, &name, data).await {
-                Ok(upload) => uploads.push(upload),
-                Err(error) => {
-                    for upload in &uploads {
-                        let _ = self.api.discard(upload).await;
-                    }
-                    return Err(error);
-                }
-            }
-        }
+        let uploads = self.upload(channel, files).await?;
         let sent = self
             .api
             .send(server(guild), channel, content, options, &uploads)
             .await;
         if sent.is_err() {
-            for upload in &uploads {
-                let _ = self.api.discard(upload).await;
-            }
+            self.discard(&uploads).await;
         }
         let value = sent?;
         self.write_names().learn_message(server(guild), &value);
         message::parse(&value).ok_or_else(|| anyhow!("could not understand Discord's answer"))
+    }
+
+    /// Uploads files for a message in `channel`, given as their names and
+    /// contents; if one fails, the others are thrown away.
+    async fn upload(
+        &self,
+        channel: &str,
+        files: Vec<(String, Vec<u8>)>,
+    ) -> Result<Vec<crate::api::Upload>> {
+        let mut uploads = Vec::with_capacity(files.len());
+        for (name, data) in files {
+            match self.api.upload(channel, &name, data).await {
+                Ok(upload) => uploads.push(upload),
+                Err(error) => {
+                    self.discard(&uploads).await;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(uploads)
+    }
+
+    /// Throws away uploads no message took.
+    async fn discard(&self, uploads: &[crate::api::Upload]) {
+        for upload in uploads {
+            let _ = self.api.discard(upload).await;
+        }
+    }
+
+    /// Posts in a server's forum, as Discord's client does: a post named
+    /// `title` with the forum's tags by id, archiving after the forum's
+    /// default quiet, or three days, and a first message of `content` and
+    /// files, given as their names and contents, uploaded to the forum.
+    /// Returns the post's id; it lists once Discord's THREAD_CREATE comes.
+    pub async fn post_in_forum(
+        &self,
+        guild: &str,
+        forum: &str,
+        title: &str,
+        tags: &[String],
+        content: &str,
+        files: Vec<(String, Vec<u8>)>,
+    ) -> Result<String> {
+        let archive_after = {
+            let snapshot = self.snapshots.borrow();
+            let forum = snapshot
+                .servers
+                .iter()
+                .find(|server| server.id == guild)
+                .and_then(|server| server.channel(forum))
+                .ok_or_else(|| anyhow!("Yapfast doesn't know that forum."))?;
+            match forum.archive_after {
+                0 => DEFAULT_ARCHIVE,
+                minutes => minutes,
+            }
+        };
+        let uploads = self.upload(forum, files).await?;
+        let posted = self
+            .api
+            .create_post(forum, title, archive_after, tags, content, &uploads)
+            .await;
+        if posted.is_err() {
+            self.discard(&uploads).await;
+        }
+        posted?["id"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("could not understand Discord's answer"))
+    }
+
+    /// Posts a poll in `channel`, of `guild`. The gateway shows it.
+    pub async fn send_poll(
+        &self,
+        guild: &str,
+        channel: &str,
+        poll: &crate::api::NewPoll,
+    ) -> Result<()> {
+        let nonce = crate::message::nonce();
+        let sent = self.api.send_poll(channel, poll, &nonce).await?;
+        self.write_names().learn_message(server(guild), &sent);
+        Ok(())
     }
 
     /// Forwards message `id` of `channel`, in `guild`, to `target`, in
@@ -1793,12 +1909,46 @@ impl Discord {
 
     /// Downloads a file from Discord's CDN, or a picture kept on disk.
     pub async fn download(&self, url: &str, limit: usize) -> Result<Vec<u8>> {
+        // An activity names a game's icon by the game until Discord says
+        // which picture it is.
+        let icon;
+        let url = match activity::icon_application(url) {
+            Some(application) => {
+                icon = self
+                    .application_icon(application)
+                    .await?
+                    .context("the application has no icon")?;
+                icon.as_str()
+            }
+            None => url,
+        };
         if let Some(kept) = cache::picture(url).await.filter(|kept| kept.len() <= limit) {
             return Ok(kept);
         }
         let data = self.api.download(url, limit).await?;
         cache::keep_picture(url, data.clone()).await;
         Ok(data)
+    }
+
+    /// The address of an application's icon, asked of Discord once.
+    async fn application_icon(&self, application: &str) -> Result<Option<String>> {
+        let lock = || {
+            self.application_icons
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
+        if let Some(known) = lock().get(application) {
+            return Ok(known.clone());
+        }
+        let found = self.api.public_applications(&[application]).await?;
+        let icon = found
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|found| found["id"] == application)
+            .and_then(activity::icon_url);
+        lock().insert(application.to_owned(), icon.clone());
+        Ok(icon)
     }
 
     /// Downloads a file from Discord's CDN into `file` as it arrives,

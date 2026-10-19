@@ -4,6 +4,39 @@ fn message_row_plain(message: &ChatMessage) -> MessageRow {
     message_row(message, &HashSet::new())
 }
 
+#[test]
+fn a_notice_is_a_group_of_its_own_with_an_icon() {
+    use yapfast_core::chat::{Notice, NoticeKind};
+    let said = ChatMessage {
+        item: "d:4".into(),
+        author: "Alice".into(),
+        sender: "discord:1".into(),
+        body: "Look".into(),
+        timestamp: 100,
+        ..Default::default()
+    };
+    let pinned = ChatMessage {
+        item: "d:5".into(),
+        body: "Alice pinned a message.".into(),
+        timestamp: 160,
+        notice: Some(Notice {
+            kind: NoticeKind::Pinned(Some("d:4".into())),
+            text: "pinned a message.".into(),
+        }),
+        ..said.clone()
+    };
+    let again = ChatMessage {
+        item: "d:6".into(),
+        timestamp: 200,
+        ..said.clone()
+    };
+    assert!(messages::continues(&said, &again));
+    assert!(!messages::continues(&said, &pinned));
+    assert!(!messages::continues(&pinned, &again));
+    assert_eq!(message_row_plain(&pinned).notice, "pin");
+    assert_eq!(message_row_plain(&said).notice, "");
+}
+
 #[cfg(feature = "discord")]
 #[test]
 fn statuses_show_their_custom_emoji_as_pictures() {
@@ -414,6 +447,34 @@ fn preferences_set_the_clock_text_size_previews_and_unmuting() {
     window.set_voice_ready(true);
     slint::platform::update_timers_and_animations();
     assert!(deafened.get() && !unmuted.get());
+}
+
+#[test]
+fn push_to_talk_keeps_its_mode_key_and_release_delay() {
+    i_slint_backend_testing::init_no_event_loop();
+    let defaults: Layout = serde_json::from_str("{}").unwrap();
+    assert_eq!(defaults.input_mode, InputMode::VoiceActivity);
+    assert_eq!(defaults.release_delay(), 20, "Discord's default");
+    let layout: Layout = serde_json::from_value(serde_json::json!({
+        "input_mode": "push_to_talk",
+        "push_to_talk_key": { "scancode": 47, "name": "V", "trigger": "v" },
+        "push_to_talk_release_delay": 5000,
+    }))
+    .unwrap();
+    assert_eq!(layout.release_delay(), 2000, "Discord's slider ends at 2 s");
+    let window = YapfastWindow::new().unwrap();
+    layout.apply(&window);
+    assert_eq!(window.get_input_mode(), 1);
+    assert_eq!(window.get_talk_key(), "V");
+    assert_eq!(window.get_talk_delay(), 2000);
+    assert!(yapfast_core::push_to_talk::on());
+    let saved = serde_json::to_value(&layout).unwrap();
+    assert_eq!(saved["input_mode"], "push_to_talk");
+    assert_eq!(saved["push_to_talk_key"]["scancode"], 47);
+    assert_eq!(saved["push_to_talk_key"]["trigger"], "v");
+    defaults.apply(&window);
+    assert!(!yapfast_core::push_to_talk::on());
+    assert_eq!(window.get_talk_key(), "");
 }
 
 #[test]
@@ -2199,6 +2260,7 @@ fn collapsed_categories_keep_the_open_unread_and_occupied_channels() {
     let row = |id: &str, heading: &str| RoomRow {
         id: id.into(),
         heading: heading.into(),
+        category: heading.into(),
         ..Default::default()
     };
     let rows = vec![
@@ -2262,17 +2324,17 @@ fn clicking_a_category_collapses_it() {
     window.invoke_explore_preview();
     let server = adapter.borrow().app.state.servers[0].id.clone();
     window.invoke_navigate_server(server.into());
-    let heading = window
+    let category = window
         .get_rooms()
         .iter()
-        .map(|row| row.heading)
-        .find(|heading| !heading.is_empty())
+        .map(|row| row.category)
+        .find(|category| !category.is_empty())
         .expect("the preview server has categories");
     assert!(!window.get_rooms().iter().any(|row| row.collapsed));
     // Nothing the app keeps changes, only how the sidebar shows it.
-    window.invoke_toggle_category(heading.clone());
+    window.invoke_toggle_category(category.clone());
     assert!(window.get_rooms().iter().any(|row| row.collapsed));
-    window.invoke_toggle_category(heading);
+    window.invoke_toggle_category(category);
     assert!(!window.get_rooms().iter().any(|row| row.collapsed));
 }
 
@@ -2656,6 +2718,177 @@ fn a_folder_on_the_rail_holds_its_servers_until_opened() {
         ]
     );
     assert!(open[1].open && open[3].tint == open[1].tint);
+}
+
+#[cfg(feature = "discord")]
+#[test]
+fn a_profile_shows_activities_as_discord_cards() {
+    let activities = yapfast_discord::activity::activities(&serde_json::json!([
+        {"type": 2, "name": "Spotify", "details": "Weightless", "state": "Marconi Union",
+         "sync_id": "6kkwzB6hXLIONkEk9JciA6",
+         "timestamps": {"start": 1_700_000_000_000_u64, "end": 1_700_000_480_000_u64},
+         "assets": {"large_image": "spotify:abc", "large_text": "Distance"}},
+        {"type": 0, "name": "Factorio", "state": "In a party", "party": {"size": [2, 4]}},
+    ]));
+    let rows: Vec<ActivityRow> = profile::activity_rows(&activities).iter().collect();
+    let spotify = &rows[0];
+    assert_eq!(spotify.heading, "LISTENING TO SPOTIFY");
+    assert_eq!(
+        (
+            spotify.name.as_str(),
+            spotify.details.as_str(),
+            spotify.state.as_str()
+        ),
+        ("Weightless", "by Marconi Union", "on Distance")
+    );
+    assert_eq!(spotify.end - spotify.start, 480);
+    assert_eq!(
+        spotify.link,
+        "https://open.spotify.com/track/6kkwzB6hXLIONkEk9JciA6"
+    );
+    assert_eq!(rows[1].state, "In a party (2 of 4)");
+    // The line under the name goes when it only names one of them.
+    assert!(profile::names_an_activity("Playing Factorio", &activities));
+    assert!(!profile::names_an_activity("Playing Chess", &activities));
+}
+
+#[test]
+fn friends_in_a_servers_voice_channel_show_where() {
+    use yapfast_core::chat::{ChatRoom, ChatServer, VoicePerson};
+    let person = |id: &str| VoicePerson {
+        id: id.into(),
+        name: id.into(),
+        ..Default::default()
+    };
+    let room = |id: &str, voice: bool, direct: bool, people: Vec<VoicePerson>| ChatRoom {
+        id: id.into(),
+        network: Network::Discord,
+        capabilities: Network::Discord.capabilities(),
+        name: id.into(),
+        direct,
+        voice,
+        encrypted: false,
+        members: 0,
+        unread: 0,
+        mentions: 0,
+        muted: false,
+        last_read: None,
+        locked: false,
+        join_locked: false,
+        read_only: false,
+        slowed: false,
+        category: String::new(),
+        category_id: None,
+        request: false,
+        person: None,
+        people,
+        ringing: Vec::new(),
+        incoming: false,
+        avatar: None,
+        upload_limit: 0,
+        presence: None,
+        activity: None,
+        activities: Default::default(),
+        parent: None,
+        forum: false,
+        preview: None,
+    };
+    let mut state = AppState::default();
+    state.rooms = vec![
+        room("lounge", true, false, vec![person("ann"), person("bob")]),
+        room("general", false, false, Vec::new()),
+        // A DM call isn't a server's voice channel.
+        room("dm", true, true, vec![person("cat")]),
+    ];
+    state.servers = vec![ChatServer {
+        id: "Alpha".into(),
+        name: "Alpha".into(),
+        channels: vec!["lounge".into(), "general".into()],
+        discord: true,
+        muted: false,
+        unavailable: false,
+        icon: None,
+        folder: None,
+        hide_muted: false,
+        pinned: Vec::new(),
+    }];
+    let rooms_by_id = state
+        .rooms
+        .iter()
+        .map(|room| (room.id.as_str(), room))
+        .collect();
+    let places = refresh::voice_places(&state, &rooms_by_id);
+    let mut found: Vec<_> = places
+        .iter()
+        .map(|(&user, place)| (user, place.room, place.channel, place.server))
+        .collect();
+    found.sort_unstable();
+    assert_eq!(
+        found,
+        [
+            ("ann", "lounge", "lounge", "Alpha"),
+            ("bob", "lounge", "lounge", "Alpha"),
+        ]
+    );
+}
+
+#[test]
+fn a_call_shows_on_its_servers_icon_and_its_closed_folder() {
+    let folder = yapfast_core::chat::ServerFolder {
+        id: "discord-folder:7".into(),
+        name: None,
+        color: None,
+    };
+    let server = |id: &str, channel: &str, folder: Option<&yapfast_core::chat::ServerFolder>| {
+        yapfast_core::chat::ChatServer {
+            id: id.into(),
+            name: id.into(),
+            channels: vec![channel.into()],
+            discord: true,
+            muted: false,
+            unavailable: false,
+            icon: None,
+            folder: folder.cloned(),
+            hide_muted: false,
+            pinned: Vec::new(),
+        }
+    };
+    let mut state = AppState::default();
+    state.servers = vec![
+        server("Alpha", "alpha-lounge", None),
+        server("Bravo", "bravo-lounge", Some(&folder)),
+    ];
+    let calls = |state: &AppState, open: &[&str]| -> Vec<(String, bool)> {
+        let open = open.iter().map(|&id| id.to_owned()).collect();
+        refresh::rail_rows(state, &HashMap::new(), &open)
+            .iter()
+            .map(|row| (row.id.to_string(), row.call))
+            .collect()
+    };
+    let none = [("Alpha".into(), false), ("discord-folder:7".into(), false)];
+    assert_eq!(calls(&state, &[]), none);
+    // A voice channel chosen but not joined yet shows nothing.
+    state.voice.room = Some("bravo-lounge".into());
+    assert_eq!(calls(&state, &[]), none);
+    state.voice.phase = yapfast_core::voice::Phase::Connected;
+    assert_eq!(
+        calls(&state, &[]),
+        [("Alpha".into(), false), ("discord-folder:7".into(), true)]
+    );
+    // Open, the folder leaves it to the server.
+    assert_eq!(
+        calls(&state, &["discord-folder:7"]),
+        [
+            ("Alpha".into(), false),
+            ("discord-folder:7".into(), true),
+            ("Bravo".into(), true),
+        ]
+    );
+    state.voice.room = Some("alpha-lounge".into());
+    assert_eq!(
+        calls(&state, &[]),
+        [("Alpha".into(), true), ("discord-folder:7".into(), false)]
+    );
 }
 
 #[test]
@@ -3167,6 +3400,39 @@ fn discord_categories_head_their_channels_and_open_their_menus() {
 
 #[test]
 #[cfg(feature = "discord")]
+fn categories_of_the_same_name_head_and_fold_their_own_channels() {
+    let (window, adapter, _directory) = discord_server_window_changed(0, |server| {
+        Arc::make_mut(&mut server.categories)
+            .get_mut("5")
+            .unwrap()
+            .name = "Talk".into();
+        server.voice_channels[0].parent = Some("5".into());
+    });
+    window.invoke_navigate_server("discord:10".into());
+    let shown = || -> Vec<(String, String, bool)> {
+        adapter
+            .borrow()
+            .models
+            .rooms
+            .iter()
+            .map(|row| (row.heading.into(), row.name.into(), row.collapsed))
+            .collect()
+    };
+    let row = |heading: &str, name: &str, collapsed| (heading.into(), name.into(), collapsed);
+    assert_eq!(
+        shown(),
+        [row("TALK", "general", false), row("TALK", "Lounge", false)]
+    );
+    window.invoke_toggle_category("discord:10:5".into());
+    assert_eq!(
+        shown(),
+        [row("TALK", "general", false), row("TALK", "", true)],
+        "only the second folds"
+    );
+}
+
+#[test]
+#[cfg(feature = "discord")]
 fn pinned_channels_leave_their_categories_for_the_top() {
     use yapfast_core::yapfast_discord::notifications::{Notifications, Override};
     let (window, adapter, _directory) = discord_server_window_changed(0, |server| {
@@ -3240,6 +3506,7 @@ fn empty_categories_go_where_discords_order_puts_them() {
     let row = |heading: &str, id: &str| RoomRow {
         id: id.into(),
         heading: heading.into(),
+        category: heading.to_lowercase().into(),
         ..Default::default()
     };
     // Each heading names its category's first channel.
@@ -3251,8 +3518,7 @@ fn empty_categories_go_where_discords_order_puts_them() {
         category("d", false),
         category("e", true),
     ];
-    let category_of = |id: &str| id.strip_suffix('1').map(str::to_owned);
-    let listed: Vec<String> = refresh::with_empty_categories(rows, &categories, category_of)
+    let listed: Vec<String> = refresh::with_empty_categories(rows, &categories)
         .iter()
         .map(|row| format!("{}{}", row.heading, if row.hidden { "!" } else { "" }))
         .collect();
@@ -3340,6 +3606,7 @@ fn channel_menus_and_their_dialog_make_change_and_delete_channels() {
         texts(rows.clone()),
         [
             "Join voice",
+            "Open chat",
             "Pin channel to top",
             "Copy link",
             "Edit channel",
@@ -3349,7 +3616,7 @@ fn channel_menus_and_their_dialog_make_change_and_delete_channels() {
             "Copy ID"
         ]
     );
-    let delete = rows.row_data(6).unwrap();
+    let delete = rows.row_data(7).unwrap();
     assert!(delete.danger && delete.separated);
     window.invoke_prepare_menu("discord:10:4".into(), false);
     assert_eq!(
@@ -3985,9 +4252,11 @@ fn requests_list_someone_once_with_their_message() {
         muted: false,
         last_read: None,
         locked: false,
+        join_locked: false,
         read_only: true,
         slowed: false,
         category: category.into(),
+        category_id: None,
         request: true,
         person: Some(person.into()),
         people: Vec::new(),
@@ -3997,6 +4266,7 @@ fn requests_list_someone_once_with_their_message() {
         upload_limit: 0,
         presence: None,
         activity: None,
+        activities: Default::default(),
         parent: None,
         forum: false,
         preview: Some(Box::new(RequestPreview {

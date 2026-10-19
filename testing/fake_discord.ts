@@ -86,8 +86,8 @@
 // Discord's notice, and both send MESSAGE_UPDATE and CHANNEL_PINS_UPDATE. GET
 // /channels/{id}/messages/search finds a DM's messages by their text, 25 at
 // a time, and GET /guilds/{id}/messages/search a server's, in the channels
-// channel_id names or in all of them; both take author_id, mentions, has,
-// min_id, max_id and pinned too. The first search of each DM or server
+// channel_id names or in all of them; both take author_id, mentions, has
+// (has=poll among them), min_id, max_id and pinned too. The first search of each DM or server
 // answers 202, as Discord's does while it indexes it.
 // POST /_control/typing makes Bob start typing in #general, or with ?dm in
 // his DM; GET /_control/typed lists the channels Alice said she was typing in.
@@ -98,6 +98,15 @@
 // request's channels, several for POST /read-states/ack-bulk.
 // POST /_control/react makes Carol add or take back a reaction on the newest
 // message in #general.
+// POST /_control/poll makes Bob post a poll in #general that Carol and Dave
+// voted in, for one answer, or with ?multi several; with ?alice it's Alice's,
+// and with ?closed its time ran out. It answers with the message's id. POST
+// /_control/poll-vote?answer=N makes Carol vote for an answer of the newest
+// poll, or take her vote back, and GET /_control/poll-votes lists Alice's
+// votes. Alice may post polls, which GET /_control/polls lists as she sent
+// them. Votes, ending a poll and its voters answer as
+// Discord's do, with MESSAGE_POLL_VOTE_ADD and _REMOVE, and once a poll ends,
+// a MESSAGE_UPDATE and a "poll closed" notice (type 46).
 // GET /users/{id}/profile answers for everyone: Bob has a bio, pronouns, a
 // banner and a server bio, Carol a banner colour, and the rest nothing more.
 // POST /_control/embeds makes Bob post an article link, whose preview arrives
@@ -171,7 +180,8 @@
 // /_control/mentions makes Bob mention her in #general every way Discord
 // highlights for her, and two ways it doesn't: by name, through Crew, with
 // @everyone and @here, in a reply to her message, then through Mods, which
-// she lacks, and not at all.
+// she lacks, and not at all. POST /_control/lounge-chat makes Bob write in
+// the Lounge voice channel's chat, mentioning her.
 // #general has a thread, "Plans", started from Bob's welcome, which Alice is
 // in and has read. POST /_control/thread-reply makes Carol write in it; POST
 // /_control/thread-start makes Bob start "Movie night" without a message,
@@ -199,7 +209,9 @@
 // /channels/{id}/post-data gives posts' first messages, as Discord's client
 // asks for its cards, and GET /_control/post-data lists each request's ids;
 // searching a forum's threads gives theirs too. POST /_control/forum-post
-// makes Carol post in it.
+// makes Carol post in it. POST /channels/{id}/threads?use_nested_fields=true
+// posts in it, as Discord's client does; POST /_control/forum-require-tag
+// (?off) sets whether a post must take a tag.
 
 import { createCipheriv, createDecipheriv } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -388,8 +400,8 @@ const JOINED_AT = "2026-09-01T09:00:00.000000+00:00";
 const bit = (n: number) => 2 ** n;
 // Invite, view, send, embed, attach, read history, react, connect, speak,
 // voice activity, change one's own nickname, make public and private threads
-// and write in them: Discord's defaults for @everyone.
-const EVERYONE = [0, 10, 11, 14, 15, 16, 6, 20, 21, 25, 26, 35, 36, 38].reduce((sum, n) => sum + bit(n), 0);
+// and write in them, and post polls: Discord's defaults for @everyone.
+const EVERYONE = [0, 10, 11, 14, 15, 16, 6, 20, 21, 25, 26, 35, 36, 38, 49].reduce((sum, n) => sum + bit(n), 0);
 // Kick, ban, manage nicknames, manage roles, moderate members, and mute,
 // deafen and move members in voice.
 const MODERATION = [1, 2, 27, 28, 40, 22, 23, 24].reduce((sum, n) => sum + bit(n), 0);
@@ -775,6 +787,16 @@ function contentType(filename: string): string {
 // --- Messages ---------------------------------------------------------------
 
 type Reaction = { name: string; id: string | null; users: Set<string> };
+type Poll = {
+  question: string;
+  answers: { id: number; text: string; emoji?: { id: string | null; name: string } }[];
+  /** When it closes, in Unix milliseconds. */
+  expiry: number;
+  multiselect: boolean;
+  /** Who voted for each answer, by answer id. */
+  votes: Map<number, Set<string>>;
+  finalized: boolean;
+};
 type Message = {
   id: string;
   channel: string;
@@ -798,11 +820,17 @@ type Message = {
   /** A forward: the message it carries a copy of, which its own content,
    * files and embeds are empty for. */
   forward?: string;
+  poll?: Poll;
+  /** A closed poll's notice (type 46): the poll's message. */
+  pollResult?: string;
+  /** A pin's notice (type 6): the message pinned. */
+  pinned?: string;
 };
 const messages = new Map<string, Message[]>([
   [GENERAL, []],
   [FORUM, []],
   [LOUNGE, []],
+  [CREATE_ROOM, []],
   [DM_BOB, []],
   [WEEKEND, []],
   [REQUEST_ERIN, []],
@@ -892,6 +920,12 @@ function wireMessage(message: Message, origin: string, nested = false): Record<s
       burst_count: 0,
     }));
   }
+  if (message.poll) wire.poll = wirePoll(message.poll);
+  const result = message.pollResult ? byId.get(message.pollResult) : undefined;
+  if (result?.poll) {
+    wire.message_reference = { type: 0, channel_id: result.channel, message_id: result.id, ...guildOf(result.channel) };
+    wire.embeds = [{ type: "poll_result", fields: pollResultFields(result.poll) }];
+  }
   const thread = threads.get(message.id);
   if (thread && !nested && message.channel !== message.id) wire.thread = wireThread(thread);
   if (message.starter && !nested) {
@@ -900,6 +934,7 @@ function wireMessage(message: Message, origin: string, nested = false): Record<s
     wire.referenced_message = original ? wireMessage(original, origin, true) : null;
   }
   if (message.notice) wire.message_reference = { type: 0, channel_id: message.notice, guild_id: GUILD };
+  if (message.pinned) wire.message_reference = { type: 0, channel_id: message.channel, message_id: message.pinned, ...guildOf(message.channel) };
   const forwarded = message.forward ? byId.get(message.forward) : undefined;
   if (forwarded) {
     const original = wireMessage(forwarded, origin, true);
@@ -933,6 +968,58 @@ function wireMessage(message: Message, origin: string, nested = false): Record<s
     wire.referenced_message = original ? wireMessage(original, origin, true) : null;
   }
   return wire;
+}
+
+/** A poll as a message carries it, with Alice's votes as hers. */
+function wirePoll(poll: Poll): Record<string, unknown> {
+  return {
+    question: { text: poll.question },
+    answers: poll.answers.map((answer) => ({
+      answer_id: answer.id,
+      poll_media: { text: answer.text, ...(answer.emoji ? { emoji: answer.emoji } : {}) },
+    })),
+    expiry: iso(poll.expiry),
+    allow_multiselect: poll.multiselect,
+    layout_type: 1,
+    results: {
+      is_finalized: poll.finalized,
+      answer_counts: poll.answers
+        .filter((answer) => (poll.votes.get(answer.id)?.size ?? 0) > 0)
+        .map((answer) => ({
+          id: answer.id,
+          count: poll.votes.get(answer.id)!.size,
+          me_voted: poll.votes.get(answer.id)!.has(ALICE),
+        })),
+    },
+  };
+}
+
+/** The fields of a closed poll's notice's embed, as strings, the winner's
+ *  left out when there's no one answer with the most votes. */
+function pollResultFields(poll: Poll): { name: string; value: string; inline: boolean }[] {
+  const count = (id: number) => poll.votes.get(id)?.size ?? 0;
+  const total = poll.answers.reduce((sum, answer) => sum + count(answer.id), 0);
+  const most = Math.max(0, ...poll.answers.map((answer) => count(answer.id)));
+  const leaders = poll.answers.filter((answer) => most > 0 && count(answer.id) === most);
+  const fields: [string, string][] = [["poll_question_text", poll.question], ["total_votes", String(total)]];
+  if (leaders.length === 1) {
+    const winner = leaders[0]!;
+    fields.push(["victor_answer_votes", String(most)], ["victor_answer_id", String(winner.id)], ["victor_answer_text", winner.text]);
+    if (winner.emoji) {
+      if (winner.emoji.id) fields.push(["victor_answer_emoji_id", winner.emoji.id]);
+      fields.push(["victor_answer_emoji_name", winner.emoji.name], ["victor_answer_emoji_animated", "false"]);
+    }
+  }
+  return fields.map(([name, value]) => ({ name, value, inline: false }));
+}
+
+/** Closes a poll: Discord sends its message again, finalized, then a notice. */
+function endPoll(message: Message, origin: string) {
+  message.poll!.finalized = true;
+  message.poll!.expiry = Math.min(message.poll!.expiry, Date.now());
+  dispatch("MESSAGE_UPDATE", dispatched(message, origin));
+  const notice = post(message.channel, message.author, "", Date.now(), { type: 46, pollResult: message.id });
+  dispatch("MESSAGE_CREATE", dispatched(notice, origin));
 }
 
 /** The server of a channel as events carry it; DMs have none. */
@@ -1124,6 +1211,7 @@ function searchFilter(url: URL): (message: Message) => boolean {
       case "embed": return (message.embeds?.("").length ?? 0) > 0;
       case "link": return /https?:\/\//.test(message.content);
       case "sticker": return (message.stickers?.length ?? 0) > 0;
+      case "poll": return !!message.poll;
       default: return false;
     }
   };
@@ -1263,6 +1351,9 @@ const FORUM_TAGS = [
 ];
 const [FEATURE, BUG, QUESTION, DONE] = FORUM_TAGS.map((tag) => tag.id) as [string, string, string, string];
 
+/** Whether #ideas requires a post to take a tag. */
+let forumRequiresTag = false;
+
 /** Starts a post in #ideas: a thread with its first message, whose id is
  *  the post's, as Discord makes one. */
 function makePost(name: string, owner: User, created: number, content: string, extra: Partial<Thread> = {}, id = nextId(created)): Thread {
@@ -1311,6 +1402,10 @@ const threadActivity = (thread: Thread) => BigInt(messages.get(thread.id)!.at(-1
 /** Each page of reactors asked for, as GET /_control/reactor-pages lists them:
  *  the message, the emoji and the query. */
 const reactorPages: string[] = [];
+/** Alice's votes, oldest first: the poll's message id and the answers. */
+const pollVotes: string[] = [];
+/** The polls Alice posted, as she sent them, as GET /_control/polls lists them. */
+const polls: unknown[] = [];
 /** Each reaction a moderator removed, as GET /_control/reactor-removals lists
  *  them: the message, the emoji and the user. */
 const reactorRemovals: string[] = [];
@@ -1324,6 +1419,25 @@ const threadMemberRequests: string[] = [];
 const threadCreates: Record<string, unknown>[] = [];
 
 /** Discord's answer to a thread name that's empty or longer than 100. */
+/** A message's `attachments` as the files uploaded for them, which leave
+ *  the uploads; undefined if one wasn't uploaded. */
+function takeUploads(attachments: any[] | undefined, channel: string): File[] | undefined {
+  const named = (attachments ?? []).map((attachment) => attachment.uploaded_filename);
+  if (named.some((name) => !uploads.get(name)?.data)) return undefined;
+  return named.map((name) => {
+    const upload = uploads.get(name)!;
+    uploads.delete(name);
+    return addFile({
+      id: nextId(Date.now()),
+      channel,
+      filename: upload.filename,
+      contentType: contentType(upload.filename),
+      data: upload.data!,
+      ...imageSize(upload.data!),
+    });
+  });
+}
+
 function threadNameError(name: unknown): Response | undefined {
   const length = typeof name === "string" ? [...name.trim()].length : 0;
   if (length >= 1 && length <= 100) return undefined;
@@ -1563,6 +1677,8 @@ function guildChannel(id: string, name: string, type: number, position: number, 
 function forumFields() {
   const posts = [...threads.values()].filter((thread) => thread.parent === FORUM);
   return {
+    // REQUIRE_TAG, as /_control/forum-require-tag sets it.
+    flags: forumRequiresTag ? 16 : 0,
     topic: "One idea per post. Search before posting." as string | null,
     nsfw: false, rate_limit_per_user: 0, default_thread_rate_limit_per_user: 0,
     // A forum's newest message is its newest post.
@@ -1888,13 +2004,34 @@ function readySupplemental() {
   };
 }
 
+// Factorio, as Discord knows the game: Bob plays it, and its icon comes
+// from GET /applications/public and the CDN's /app-icons/.
+const FACTORIO = "1400000000000000900";
+const applications: Record<string, { id: string; name: string; icon: string | null }> = {
+  [FACTORIO]: { id: FACTORIO, name: "Factorio", icon: "factorioicon" },
+};
+// Bob has played for 42 minutes when the fake starts, and Carol is 80 seconds
+// into an eight-minute song, its cover on /spotify/.
+const fakeStarted = Date.now();
+
 // Who is around and what they're doing, as their presence says.
 const presences: Record<string, { status: string; activities: unknown[]; client_status?: Record<string, string> }> = {
   [users.alice.id]: { status: "online", activities: [] },
-  [users.bob.id]: { status: "dnd", activities: [{ type: 0, name: "Factorio" }] },
+  [users.bob.id]: {
+    status: "dnd",
+    activities: [{ type: 0, name: "Factorio", application_id: FACTORIO, timestamps: { start: fakeStarted - 42 * 60_000 } }],
+  },
   [users.carol.id]: {
     status: "idle",
-    activities: [{ type: 4, name: "Custom Status", state: "back later\nafter dinner, probably", emoji: { name: "🌙", id: null } }],
+    activities: [
+      { type: 4, name: "Custom Status", state: "back later\nafter dinner, probably", emoji: { name: "🌙", id: null } },
+      {
+        type: 2, name: "Spotify", details: "Weightless", state: "Marconi Union", sync_id: "6kkwzB6hXLIONkEk9JciA6",
+        party: { id: `spotify:${users.carol.id}` }, flags: 48,
+        timestamps: { start: fakeStarted - 80_000, end: fakeStarted - 80_000 + 8 * 60_000 },
+        assets: { large_image: "spotify:ab67616d0000b273fake", large_text: "Distance" },
+      },
+    ],
   },
   [users.dave.id]: { status: "offline", activities: [] },
 };
@@ -3518,27 +3655,41 @@ async function api(req: Request, path: string, origin: string): Promise<Response
         dispatch("MESSAGE_CREATE", dispatched(forward, origin));
         return json(wireMessage(forward, origin));
       }
-      const reply = body.message_reference?.message_id;
-      const attached: File[] = [];
-      for (const attachment of body.attachments ?? []) {
-        const upload = uploads.get(attachment.uploaded_filename);
-        if (!upload?.data) return json({ message: "Invalid Form Body", code: 50035 }, 400);
-        uploads.delete(attachment.uploaded_filename);
-        attached.push(
-          addFile({
-            id: nextId(Date.now()),
-            channel: m[1]!,
-            filename: upload.filename,
-            contentType: contentType(upload.filename),
-            data: upload.data,
-            ...imageSize(upload.data),
-          }),
-        );
+      // A poll, as Discord takes it: a question, one to ten answers, and
+      // how many hours it takes votes, up to 32 days'.
+      let poll: Poll | undefined;
+      if (body.poll) {
+        const asked = body.poll;
+        const answers: any[] = asked.answers ?? [];
+        const question = asked.question?.text ?? "";
+        const hours = Number(asked.duration ?? 24);
+        if (!question || question.length > 300 || answers.length < 1 || answers.length > 10
+            || answers.some((answer) => !answer.poll_media?.text || answer.poll_media.text.length > 55)
+            || !(hours >= 1 && hours <= 768) || body.content) {
+          return json({ message: "Invalid Form Body", code: 50035 }, 400);
+        }
+        poll = {
+          question,
+          answers: answers.map((answer, index) => ({
+            id: index + 1,
+            text: answer.poll_media.text,
+            ...(answer.poll_media.emoji ? { emoji: { id: answer.poll_media.emoji.id ?? null, name: answer.poll_media.emoji.name ?? "" } } : {}),
+          })),
+          expiry: Date.now() + hours * 3_600_000,
+          multiselect: !!asked.allow_multiselect,
+          votes: new Map(),
+          finalized: false,
+        };
+        polls.push(asked);
       }
+      const reply = body.message_reference?.message_id;
+      const attached = takeUploads(body.attachments, m[1]!);
+      if (!attached) return json({ message: "Invalid Form Body", code: 50035 }, 400);
       const message = post(m[1]!, users.alice, body.content ?? "", Date.now(), {
         nonce: body.nonce ? String(body.nonce) : undefined,
         reply: reply && byId.has(reply) ? reply : undefined,
         files: attached,
+        poll,
       });
       // An env's favourite GIF comes with its embed, so a recording doesn't
       // show its link for the moment before the embed would come.
@@ -3664,6 +3815,61 @@ async function api(req: Request, path: string, origin: string): Promise<Response
     return empty();
   }
 
+  // Alice's vote, in place of her earlier one; none takes it back.
+  if (method === "PUT" && (m = path.match(/^\/channels\/(\d+)\/polls\/(\d+)\/answers\/@me$/))) {
+    const message = byId.get(m[2]!);
+    if (!message || message.channel !== m[1]) return notFound("Unknown Message", 10008);
+    const poll = message.poll;
+    if (!poll) return json({ message: "Invalid Form Body", code: 50035 }, 400);
+    if (poll.finalized || poll.expiry <= Date.now()) return json({ message: "Poll voting blocked", code: 520000 }, 400);
+    const body: any = await req.json();
+    const chosen: number[] = (body.answer_ids ?? []).map(Number);
+    if (!Array.isArray(body.answer_ids) || (chosen.length > 1 && !poll.multiselect)
+        || chosen.some((id) => !poll.answers.some((answer) => answer.id === id))) {
+      return json({ message: "Invalid Form Body", code: 50035 }, 400);
+    }
+    for (const answer of poll.answers) {
+      const voters = poll.votes.get(answer.id) ?? new Set<string>();
+      poll.votes.set(answer.id, voters);
+      const add = chosen.includes(answer.id);
+      if (voters.has(ALICE) === add) continue;
+      if (add) voters.add(ALICE);
+      else voters.delete(ALICE);
+      dispatch(add ? "MESSAGE_POLL_VOTE_ADD" : "MESSAGE_POLL_VOTE_REMOVE", {
+        user_id: ALICE,
+        channel_id: message.channel,
+        message_id: message.id,
+        ...guildOf(message.channel),
+        answer_id: answer.id,
+      });
+    }
+    pollVotes.push(`${message.id} ${chosen.join(",")}`);
+    return empty();
+  }
+
+  if (method === "POST" && (m = path.match(/^\/channels\/(\d+)\/polls\/(\d+)\/expire$/))) {
+    const message = byId.get(m[2]!);
+    if (!message || message.channel !== m[1] || !message.poll) return notFound("Unknown Message", 10008);
+    if (message.author.id !== ALICE) return json({ message: "Missing Permissions", code: 50013 }, 403);
+    if (!message.poll.finalized) endPoll(message, origin);
+    return json(wireMessage(message, origin));
+  }
+
+  // Who voted for an answer, as Discord pages them: by user id, from after
+  // ?after, up to ?limit (25 unless it says, 100 at most).
+  if (method === "GET" && (m = path.match(/^\/channels\/(\d+)\/polls\/(\d+)\/answers\/(\d+)$/))) {
+    const message = byId.get(m[2]!);
+    if (!message || message.channel !== m[1] || !message.poll) return notFound("Unknown Message", 10008);
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") ?? 25)));
+    const after = BigInt(url.searchParams.get("after") ?? 0);
+    const users = [...(message.poll.votes.get(Number(m[3])) ?? [])]
+      .map((user) => userById.get(user)!)
+      .filter((user) => BigInt(user.id) > after)
+      .sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1))
+      .slice(0, limit);
+    return json({ users: users.map(wireUser) });
+  }
+
   if (method === "POST" && (m = path.match(/^\/channels\/(\d+)\/typing$/))) {
     if (!messages.has(m[1]!)) return notFound("Unknown Channel", 10003);
     typed.push(m[1]!);
@@ -3716,7 +3922,7 @@ async function api(req: Request, path: string, origin: string): Promise<Response
     const others = list.filter((pin) => pin.message !== message);
     if (method === "PUT" && others.length === list.length) {
       pins.set(message.channel, [{ message, at: Date.now() }, ...others]);
-      dispatch("MESSAGE_CREATE", dispatched(post(message.channel, users.alice, "", Date.now(), { type: 6 }), origin));
+      dispatch("MESSAGE_CREATE", dispatched(post(message.channel, users.alice, "", Date.now(), { type: 6, pinned: message.id }), origin));
     } else if (method === "DELETE") {
       pins.set(message.channel, others);
     }
@@ -3774,6 +3980,43 @@ async function api(req: Request, path: string, origin: string): Promise<Response
     dispatch("MESSAGE_UPDATE", dispatched(original, origin));
     if (!messages.get(parent)!.slice(-10).includes(original)) noticeThread(thread, origin);
     return json(wireThread(thread), 201);
+  }
+
+  // Posting in #ideas, as Discord's client does with use_nested_fields:
+  // a title, at most five of its tags, the moderated one only for those
+  // who manage threads (not Alice), one when the forum requires it, and a
+  // first message of text, uploaded files or both, whose id is the post's.
+  // THREAD_CREATE and THREAD_MEMBERS_UPDATE come, then the message; the
+  // answer is the post with its message.
+  if (method === "POST" && path === `/channels/${FORUM}/threads`) {
+    const body: any = await req.json();
+    threadCreates.push({ channel: FORUM, ...body });
+    const invalid = threadNameError(body.name);
+    if (invalid) return invalid;
+    const tags: string[] = body.applied_tags ?? [];
+    const known = FORUM_TAGS.filter((tag) => !tag.moderated).map((tag) => tag.id);
+    if (tags.length > 5 || tags.some((tag) => !known.includes(tag))) {
+      return json({ message: "Invalid Form Body", code: 50035, errors: { applied_tags: { _errors: [{ code: "INVALID_TAG", message: "Invalid tag" }] } } }, 400);
+    }
+    if (forumRequiresTag && tags.length === 0) {
+      return json({ message: "A tag is required to create a forum post in this channel", code: 40067 }, 400);
+    }
+    const content = String(body.message?.content ?? "");
+    if (!content.trim() && !body.message?.attachments?.length) {
+      return json({ message: "Cannot send an empty message", code: 50006 }, 400);
+    }
+    const now = Date.now();
+    const id = nextId(now);
+    const files = takeUploads(body.message?.attachments, id);
+    if (!files) return json({ message: "Invalid Form Body", code: 50035 }, 400);
+    const thread = makePost(body.name.trim(), users.alice, now, content, {
+      tags, autoArchive: body.auto_archive_duration ?? 4320,
+    }, id);
+    const first = byId.get(thread.id)!;
+    first.files.push(...files);
+    announceThread(thread);
+    dispatch("MESSAGE_CREATE", dispatched(first, origin));
+    return json({ ...(wireThread(thread) as Record<string, unknown>), message: wireMessage(first, origin) }, 201);
   }
 
   // Starting a thread without a message: public or private in a text
@@ -4016,6 +4259,10 @@ async function api(req: Request, path: string, origin: string): Promise<Response
       setTimeout(() => relationships.get(user.id) === 4 && befriend(user, 1), FRIEND_ACCEPT_MS);
     }
   };
+  // Applications' public objects, as the client asks for activities' icons.
+  if (method === "GET" && path === "/applications/public") {
+    return json(url.searchParams.getAll("application_ids").flatMap((id) => applications[id] ?? []));
+  }
   if (method === "POST" && path === "/users/@me/relationships") {
     if (where() !== "Add Friend") return json({ message: "Invalid Form Body", code: 50035 }, 400);
     const body: any = await req.json().catch(() => ({}));
@@ -5211,6 +5458,10 @@ const server = Bun.serve<SocketData>({
     }
     // Discord's CDN: server icons, avatars and banners, and those uploaded
     // as they came.
+    // Activities' pictures: games' icons and assets, and Spotify's covers.
+    if (req.method === "GET" && /^\/(app-icons\/\d+\/[a-z0-9]+\.png|app-assets\/\d+\/[a-z0-9]+\.png|spotify\/[A-Za-z0-9]+)$/.test(path)) {
+      return new Response(picture(path), { headers: { "content-type": "image/png" } });
+    }
     if (req.method === "GET" && /^\/(icons\/\d+|avatars\/\d+|banners\/\d+|embed\/avatars|guilds\/\d+\/users\/\d+\/(avatars|banners))\/[^/]+\.png$/.test(path)) {
       const uploaded = uploadedPictures.get(path.slice(path.lastIndexOf("/") + 1, -".png".length));
       if (uploaded) return new Response(uploaded.data, { headers: { "content-type": uploaded.type } });
@@ -5560,6 +5811,11 @@ const server = Bun.serve<SocketData>({
     }
     // Carol posts in #ideas, as Discord tells of a new post: THREAD_CREATE,
     // then its first message.
+    if (req.method === "POST" && path === "/_control/forum-require-tag") {
+      forumRequiresTag = !url.searchParams.has("off");
+      dispatch("CHANNEL_UPDATE", guild().channels.find((channel) => channel.id === FORUM));
+      return new Response(`#ideas ${forumRequiresTag ? "requires" : "doesn't require"} a tag\n`);
+    }
     if (req.method === "POST" && path === "/_control/forum-post") {
       const now = Date.now();
       const thread = makePost("Emoji picker search", users.carol, now, "Searching emoji by keyword would help.", { tags: [FEATURE] });
@@ -5611,6 +5867,14 @@ const server = Bun.serve<SocketData>({
       });
       return new Response("Bob mentioned Alice\n");
     }
+    if (req.method === "POST" && path === "/_control/lounge-chat") {
+      const now = Date.now();
+      for (const [index, content] of ["Who's up for a round?", `<@${ALICE}> hop in when you can`].entries()) {
+        const message = post(LOUNGE, users.bob, content, now + index);
+        dispatch("MESSAGE_CREATE", dispatched(message, origin));
+      }
+      return new Response("Bob wrote in the Lounge's chat\n");
+    }
     if (req.method === "POST" && path === "/_control/typing") {
       const dm = url.searchParams.has("dm");
       dispatch("TYPING_START", {
@@ -5640,6 +5904,58 @@ const server = Bun.serve<SocketData>({
         ...(add ? { member: member(users.carol), message_author_id: message.author.id } : {}),
       });
       return new Response(add ? "Carol reacted\n" : "Carol took her reaction back\n");
+    }
+    if (req.method === "POST" && path === "/_control/poll") {
+      const now = Date.now();
+      const closed = url.searchParams.has("closed");
+      const poll: Poll = {
+        question: "Where should we eat after the ferry?",
+        answers: [
+          { id: 1, text: "Pizza by the harbour", emoji: { id: null, name: "🍕" } },
+          { id: 2, text: "Ramen", emoji: { id: null, name: "🍜" } },
+          { id: 3, text: "Wherever the talk is", emoji: { id: EMOJI_TALK, name: "talk" } },
+          { id: 4, text: "Home, I'm tired" },
+        ],
+        expiry: closed ? now - 60_000 : now + 24 * 3_600_000,
+        multiselect: url.searchParams.has("multi"),
+        votes: new Map([
+          [1, new Set([users.carol.id])],
+          [2, new Set([users.dave.id, users.bob.id])],
+        ]),
+        finalized: closed,
+      };
+      const author = url.searchParams.has("alice") ? users.alice : users.bob;
+      const message = post(GENERAL, author, "", now, { poll });
+      dispatch("MESSAGE_CREATE", dispatched(message, origin));
+      if (closed) {
+        const notice = post(GENERAL, author, "", now + 1, { type: 46, pollResult: message.id });
+        dispatch("MESSAGE_CREATE", dispatched(notice, origin));
+      }
+      return new Response(`${message.id}\n`);
+    }
+    if (req.method === "POST" && path === "/_control/poll-vote") {
+      const message = messages.get(GENERAL)!.findLast((message) => message.poll);
+      const answer = Number(url.searchParams.get("answer") ?? 1);
+      if (!message?.poll?.answers.some((known) => known.id === answer)) return new Response("No such poll answer\n", { status: 400 });
+      const voters = message.poll.votes.get(answer) ?? new Set<string>();
+      message.poll.votes.set(answer, voters);
+      const add = !voters.has(users.carol.id);
+      if (add) voters.add(users.carol.id);
+      else voters.delete(users.carol.id);
+      dispatch(add ? "MESSAGE_POLL_VOTE_ADD" : "MESSAGE_POLL_VOTE_REMOVE", {
+        user_id: users.carol.id,
+        channel_id: GENERAL,
+        message_id: message.id,
+        guild_id: GUILD,
+        answer_id: answer,
+      });
+      return new Response(add ? "Carol voted\n" : "Carol took her vote back\n");
+    }
+    if (req.method === "GET" && path === "/_control/poll-votes") {
+      return Response.json(pollVotes);
+    }
+    if (req.method === "GET" && path === "/_control/polls") {
+      return Response.json(polls);
     }
     if (req.method === "GET" && path === "/_control/typed") {
       return Response.json(typed);

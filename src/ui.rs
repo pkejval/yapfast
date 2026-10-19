@@ -48,6 +48,7 @@ mod messages;
 mod move_loop;
 mod pictures;
 mod placement;
+mod polls;
 mod profile;
 mod refresh;
 mod shell;
@@ -142,6 +143,7 @@ pub fn run(
     bind_callbacks(&window, &adapter);
     watch_window(&window, &adapter);
     adapter.borrow_mut().watch_away();
+    adapter.borrow_mut().watch_talk_key(&window);
     adapter.borrow_mut().refresh(&window);
     if preview {
         adapter.borrow_mut().action(&window, Action::Preview);
@@ -244,7 +246,13 @@ const ZOOM_NOTE: Duration = Duration::from_millis(1200);
 /// with Ctrl and +, - and 0 or the scroll wheel, keeping the level in the
 /// layout, and takes files dropped on it.
 fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
-    use slint::winit_030::{EventResult, winit::event::WindowEvent};
+    use slint::winit_030::{
+        EventResult,
+        winit::{
+            event::{ElementState, WindowEvent},
+            keyboard::{Key, NamedKey},
+        },
+    };
     let saved = zoom::saved(adapter.borrow().layout.zoom);
     let adapter = Rc::downgrade(adapter);
     let (to, weak) = (adapter.clone(), window.as_weak());
@@ -375,6 +383,32 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
                             zoom::apply(window.window(), base.get(), level.get());
                         }
                     });
+                }
+                crate::push_to_talk::window_event(event);
+                // While recording the push-to-talk key, the next key becomes
+                // it, and Escape stops; either way only the recorder sees it.
+                if let WindowEvent::KeyboardInput { event: key, .. } = event
+                    && key.state == ElementState::Pressed
+                    && let Some(window) = weak.upgrade()
+                    && window.get_talk_recording()
+                {
+                    if !key.repeat {
+                        window.set_talk_recording(false);
+                        let recorded = (key.logical_key != Key::Named(NamedKey::Escape))
+                            .then(|| crate::push_to_talk::Keybind::recorded(key))
+                            .flatten();
+                        if let Some(recorded) = recorded {
+                            let (adapter, weak) = (adapter.clone(), weak.clone());
+                            slint::Timer::single_shot(Duration::ZERO, move || {
+                                if let (Some(adapter), Some(window)) =
+                                    (adapter.upgrade(), weak.upgrade())
+                                {
+                                    adapter.borrow_mut().set_talk_key(&window, recorded);
+                                }
+                            });
+                        }
+                    }
+                    return EventResult::PreventDefault;
                 }
                 let step = match keys.event(event) {
                     zoom::Outcome::Pass => return EventResult::Propagate,
@@ -688,8 +722,8 @@ struct Layout {
     zoom: Option<f32>,
     /// Each server's last selected channel, by server ID.
     channels: HashMap<String, String>,
-    /// Each server's collapsed channel categories, by server ID, as their
-    /// headings show them.
+    /// Each server's collapsed channel categories, by server ID: a Discord
+    /// category by its room id, any other by its heading.
     collapsed: HashMap<String, std::collections::BTreeSet<String>>,
     /// The rail's open folders, by folder ID.
     open_folders: std::collections::BTreeSet<String>,
@@ -737,6 +771,12 @@ struct Layout {
     reduce_room_echo: bool,
     /// The quietest speech Discord calls send, in dBFS; -60 unless changed.
     input_sensitivity: Option<i32>,
+    /// Whether calls send the voice the gate hears or only while a key is
+    /// held, the key, and how long the microphone sends after it comes up,
+    /// in ms; Discord's 20 unless changed.
+    input_mode: InputMode,
+    push_to_talk_key: Option<crate::push_to_talk::Keybind>,
+    push_to_talk_release_delay: Option<u32>,
     /// How loud people sound in calls, and their streams, by Discord or
     /// Matrix user id; see [`yapfast_core::volume`]. Unlisted people are as they
     /// come.
@@ -799,6 +839,17 @@ const STRENGTHS: [yapfast_core::noise::Strength; 3] = [
     yapfast_core::noise::Strength::Light,
 ];
 
+/// How calls decide when to send the microphone, as Discord's Input Mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum InputMode {
+    #[default]
+    VoiceActivity,
+    PushToTalk,
+}
+
+const INPUT_MODES: [InputMode; 2] = [InputMode::VoiceActivity, InputMode::PushToTalk];
+
 /// When GIFs, animated emoji and stickers play. Held still, an animation
 /// decodes no frame past the one showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -856,6 +907,13 @@ impl Layout {
         self.input_sensitivity
             .unwrap_or(yapfast_core::noise::DEFAULT_SENSITIVITY as i32)
             .clamp(-80, 0)
+    }
+
+    /// How long the microphone sends after the push-to-talk key comes up, in ms.
+    fn release_delay(&self) -> u32 {
+        self.push_to_talk_release_delay
+            .unwrap_or(yapfast_core::push_to_talk::DEFAULT_RELEASE_DELAY)
+            .min(yapfast_core::push_to_talk::MOST_RELEASE_DELAY)
     }
 
     fn read(root: &std::path::Path) -> Self {
@@ -935,6 +993,17 @@ impl Layout {
         let sensitivity = self.sensitivity();
         window.set_sensitivity(sensitivity);
         yapfast_core::noise::set_sensitivity(sensitivity as f32);
+        window.set_input_mode(choice(&INPUT_MODES, self.input_mode));
+        yapfast_core::push_to_talk::set_on(self.input_mode == InputMode::PushToTalk);
+        window.set_talk_key(
+            self.push_to_talk_key
+                .as_ref()
+                .map(|key| key.name.as_str())
+                .unwrap_or_default()
+                .into(),
+        );
+        window.set_talk_delay(self.release_delay() as i32);
+        yapfast_core::push_to_talk::set_release_delay(self.release_delay());
         for (person, volume) in &self.volumes {
             yapfast_core::volume::set(yapfast_core::volume::Kind::Voice, person, *volume);
         }
@@ -1034,9 +1103,14 @@ struct Models {
     thread_rows: Rc<VecModel<ThreadRow>>,
     /// The open forum's posts.
     post_rows: Rc<VecModel<PostRow>>,
+    /// The form for a post's chosen tags, and those it offers.
+    post_chosen_tags: Rc<VecModel<PostTagChoice>>,
+    post_tag_choices: Rc<VecModel<PostTagChoice>>,
     /// The Reactions window's reactions, and who reacted with the chosen one.
     reaction_pills: Rc<VecModel<ReactionPill>>,
     reactor_rows: Rc<VecModel<ReactorRow>>,
+    /// The answers of the poll being made.
+    poll_answers: Rc<VecModel<PollAnswerDraft>>,
     search_results: Rc<VecModel<FoundRow>>,
     add_people: Rc<VecModel<PickRow>>,
     role_members: Rc<VecModel<MemberRow>>,
@@ -1082,8 +1156,11 @@ impl Models {
         window.set_pins(ModelRc::from(self.pins.clone()));
         window.set_thread_rows(ModelRc::from(self.thread_rows.clone()));
         window.set_post_rows(ModelRc::from(self.post_rows.clone()));
+        window.set_post_chosen_tags(ModelRc::from(self.post_chosen_tags.clone()));
+        window.set_post_tag_choices(ModelRc::from(self.post_tag_choices.clone()));
         window.set_reaction_pills(ModelRc::from(self.reaction_pills.clone()));
         window.set_reactor_rows(ModelRc::from(self.reactor_rows.clone()));
+        window.set_poll_answers(ModelRc::from(self.poll_answers.clone()));
         window.set_search_results(ModelRc::from(self.search_results.clone()));
         window.set_add_people(ModelRc::from(self.add_people.clone()));
         window.set_role_members(ModelRc::from(self.role_members.clone()));
@@ -1110,6 +1187,7 @@ impl Models {
 
 struct Icons {
     dm: slint::Image,
+    chat: slint::Image,
     text: slint::Image,
     thread: slint::Image,
     forum: slint::Image,
@@ -1165,10 +1243,15 @@ struct Adapter {
     window: slint::Weak<YapfastWindow>,
     away: away::Away,
     call_timer: call_timer::CallTimer,
+    /// Ticks ActivityClock while a profile on screen times an activity.
+    activity_clock: slint::Timer,
     navigation: Navigation,
     /// Whether the forward dialog was open at the last refresh.
     forwarding: bool,
     selection_version: u64,
+    /// The conversation just shown was still loading, when its composer is
+    /// disabled and takes no focus; it takes it once the messages come.
+    focus_when_ready: bool,
     reset_version: u64,
     /// The timeline shown, which tells the messages that changed since.
     messages: Arc<Vec<Arc<ChatMessage>>>,
@@ -1182,6 +1265,9 @@ struct Adapter {
     aside_restyle: bool,
     /// What the sidebar showed last, so it's built again only once that changes.
     sidebar: Option<SidebarShown>,
+    /// The voice channel of the call the rail last showed, so a voice event
+    /// builds the rail again only when the call moves.
+    rail_call: Option<String>,
     /// A hash of what the friends picker's rows were built from, so they're
     /// built again only once that changes.
     picker_shown: Option<u64>,
@@ -1192,6 +1278,10 @@ struct Adapter {
     forum_shown: Option<u64>,
     /// The topic the header shows, so it's styled again only once it changes.
     topic_shown: Option<Arc<yapfast_core::chat::Topic>>,
+    /// The forum's guidelines as the form for a post last showed them, and
+    /// the tags it offered and had.
+    guidelines_shown: Option<Arc<yapfast_core::chat::Topic>>,
+    post_tags_shown: Option<(Vec<yapfast_core::chat::ForumTag>, Vec<String>)>,
     /// Shows pictures that arrived, together with those that follow them closely.
     pictures_due: slint::Timer,
     /// Writes the layout once the window holds still after moving or resizing.
@@ -1215,8 +1305,11 @@ struct Adapter {
     /// ones, and show at the end the moment they come. Following the
     /// window's end until then would load earlier pages as they go in.
     latest_due: bool,
-    /// Spoilers clicked; see `message_row`.
+    /// Spoilers clicked, and what was picked or shown on polls; see
+    /// `message_row`.
     revealed: HashSet<String>,
+    /// The minute the timeline was last checked for a poll's time left.
+    poll_minute: u64,
     /// The preferences that shape message rows changed, so they're built again.
     restyle: bool,
     /// Appearance's theme editor, while it's open.
@@ -1255,6 +1348,9 @@ struct Adapter {
     /// show the voice gate's sensitivity.
     #[cfg(feature = "discord")]
     gate_meter: Option<yapfast_core::discord_audio::GateMeter>,
+    /// Watches the push-to-talk key while push to talk is on and it's set,
+    /// with or without the window.
+    talk_key: Option<crate::push_to_talk::Watcher>,
     /// Previews of the pictures waiting in the composer, by file; `None` while
     /// one is read, or when it can't be.
     thumbnails: HashMap<PathBuf, Option<pictures::Thumbnail>>,
@@ -1290,6 +1386,9 @@ impl Adapter {
     ) -> Result<Rc<RefCell<Self>>> {
         let icons = Icons {
             dm: slint::Image::load_from_svg_data(include_bytes!("../ui/icons/message-circle.svg"))?,
+            chat: slint::Image::load_from_svg_data(include_bytes!(
+                "../ui/icons/message-square-text.svg"
+            ))?,
             text: slint::Image::load_from_svg_data(include_bytes!("../ui/icons/hash.svg"))?,
             thread: slint::Image::load_from_svg_data(include_bytes!(
                 "../ui/icons/messages-square.svg"
@@ -1414,17 +1513,22 @@ impl Adapter {
                 window: window.as_weak(),
                 away: away::Away::default(),
                 call_timer: call_timer::CallTimer::default(),
+                activity_clock: slint::Timer::default(),
                 navigation: Navigation::default(),
                 forwarding: false,
                 selection_version: 0,
+                focus_when_ready: false,
                 reset_version: 0,
                 messages: Arc::new(Vec::new()),
                 rows: Vec::new(),
                 sidebar: None,
+                rail_call: None,
                 picker_shown: None,
                 threads_shown: None,
                 forum_shown: None,
                 topic_shown: None,
+                guidelines_shown: None,
+                post_tags_shown: None,
                 pictures_due: slint::Timer::default(),
                 placement_due: slint::Timer::default(),
                 video_quiet: Cell::new(0),
@@ -1435,6 +1539,7 @@ impl Adapter {
                 unread_jumped: 0,
                 latest_due: false,
                 revealed: HashSet::new(),
+                poll_minute: 0,
                 restyle: false,
                 theme_editor: None,
                 aside_messages: Arc::new(Vec::new()),
@@ -1456,6 +1561,7 @@ impl Adapter {
                 tiles: None,
                 #[cfg(feature = "discord")]
                 gate_meter: None,
+                talk_key: None,
                 thumbnails: HashMap::new(),
                 pasted: None,
                 #[cfg(feature = "discord")]
@@ -1472,6 +1578,44 @@ impl Adapter {
         }))
     }
 
+    /// Starts, changes or stops watching the push-to-talk key as settings
+    /// say, and shows where it works.
+    fn watch_talk_key(&mut self, window: &YapfastWindow) {
+        let wanted = self
+            .layout
+            .push_to_talk_key
+            .as_ref()
+            .filter(|_| self.layout.input_mode == InputMode::PushToTalk);
+        if self
+            .talk_key
+            .as_ref()
+            .map(crate::push_to_talk::Watcher::key)
+            != wanted
+        {
+            // The old one goes first, ending its portal session.
+            self.talk_key = None;
+            self.talk_key = wanted.cloned().map(|key| {
+                let weak = window.as_weak();
+                crate::push_to_talk::Watcher::start(key, &self.runtime, move |reach| {
+                    let _ = weak.upgrade_in_event_loop(move |window| {
+                        window.set_talk_note(reach.note().into());
+                    });
+                })
+            });
+        }
+        let note = self.talk_key.as_ref().map(|watcher| watcher.reach().note());
+        window.set_talk_note(note.unwrap_or_default().into());
+    }
+
+    /// Makes a recorded key the push-to-talk key.
+    fn set_talk_key(&mut self, window: &YapfastWindow, key: crate::push_to_talk::Keybind) {
+        tracing::info!(key = key.name, "push-to-talk key recorded");
+        window.set_talk_key(key.name.as_str().into());
+        self.layout.push_to_talk_key = Some(key);
+        self.layout.write(&self.root);
+        self.watch_talk_key(window);
+    }
+
     /// Present the existing models and state in a new window.
     fn attach(&mut self, window: &YapfastWindow) {
         self.models.attach(window);
@@ -1482,6 +1626,7 @@ impl Adapter {
         }
         window.set_has_tray_idle_icon(self.tray_idle_icon.is_some());
         window.set_has_tray_speaking_icon(self.tray_speaking_icon.is_some());
+        self.watch_talk_key(window);
         // The theme being edited goes unsaved with the old window, and rows
         // may carry its mention colour; the refresh after attaching builds
         // them again.

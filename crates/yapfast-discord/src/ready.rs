@@ -62,6 +62,8 @@ pub mod permission {
     pub const SEND_MESSAGES_IN_THREADS: u64 = 1 << 38;
     /// Timing members out.
     pub const MODERATE_MEMBERS: u64 = 1 << 40;
+    /// Posting polls, besides sending messages.
+    pub const SEND_POLLS: u64 = 1 << 49;
     /// Pinning messages and unpinning them, which `MANAGE_MESSAGES` once gave.
     pub const PIN_MESSAGES: u64 = 1 << 51;
     /// Sending without waiting out a channel's slowmode, which
@@ -585,6 +587,13 @@ impl Server {
         } else {
             Access::Join
         }
+    }
+
+    /// Whether `user`, holding `roles`, may send in `channel`'s text. A voice
+    /// channel's chat asks this apart from [`Self::access`], which is about
+    /// connecting to it.
+    pub fn may_send(&self, channel: &Channel, user: &str, roles: &[String]) -> bool {
+        self.roles.is_empty() || self.channel_permissions(channel, user, roles) & SEND_MESSAGES != 0
     }
 
     /// Whether `user`, holding `roles`, waits out `channel`'s slowmode
@@ -1205,12 +1214,12 @@ pub fn display_name(user: &Value) -> Option<&str> {
 }
 
 /// Discord's CDN, or the test server.
-fn cdn() -> &'static str {
+pub(crate) fn cdn() -> &'static str {
     client::test_server().unwrap_or("https://cdn.discordapp.com")
 }
 
 /// Discord's media proxy, or the test server.
-fn media() -> &'static str {
+pub(crate) fn media() -> &'static str {
     client::test_server().unwrap_or("https://media.discordapp.net")
 }
 

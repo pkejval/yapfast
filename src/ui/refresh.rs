@@ -199,6 +199,7 @@ impl Adapter {
         self.show_dm_tools(window);
         self.show_threads(window);
         self.show_forum(window);
+        self.show_new_post(window);
         self.show_new_thread(window);
         self.show_members(window);
         self.show_invite(window);
@@ -214,7 +215,13 @@ impl Adapter {
         self.show_voice(window);
         self.show_video(window);
         let state = &self.app.state;
-        if changes.selection && state.selected_room().is_some_and(|room| !room.voice) {
+        if changes.selection {
+            self.focus_when_ready = state.shows_text() && !state.room_ready;
+        }
+        if changes.selection && state.shows_text() {
+            window.invoke_focus_composer();
+        } else if self.focus_when_ready && state.room_ready {
+            self.focus_when_ready = false;
             window.invoke_focus_composer();
         } else if changes.reset && !state.preview && state.account.is_none() {
             window.invoke_focus_sign_in();
@@ -390,18 +397,12 @@ impl Adapter {
             .iter()
             .map(|room| (room.id.as_str(), room))
             .collect();
-        // Unread DMs come and go above the servers, so the rows keep their
-        // places by id rather than all moving down one.
-        let mut rail = unread_dm_rows(state);
-        rail.push(ServerRow {
-            divider: true,
-            ..Default::default()
-        });
-        rail.extend(rail_rows(state, &rooms_by_id, &self.layout.open_folders));
+        self.rail_call = call_room(state).map(str::to_owned);
+        let rail = rail(state, &rooms_by_id, &self.layout.open_folders);
         update_model_by_id(&self.models.servers, rail, |row| row.id.clone());
         let mut listed_text = false;
         let mut listed_voice = false;
-        let mut category: Option<&str> = None;
+        let mut category = None;
         let mut listed: Vec<_> = state
             .scoped_rooms()
             .filter(|room| room.name.to_lowercase().contains(&query))
@@ -427,12 +428,14 @@ impl Adapter {
         update_model(&self.models.requests_spam, requests.spam);
         // The friends list, those around first; filtered by the screen's search.
         let friend_query = window.get_friend_filter().to_lowercase();
+        let in_voice = voice_places(state, &rooms_by_id);
         let friend_rows: Vec<_> = state
             .friends
             .iter()
             .filter(|friend| friend.name.to_lowercase().contains(friend_query.trim()))
             .map(|friend| {
                 let (activity, activity_emoji) = activity_line(friend.activity.as_deref());
+                let voice = in_voice.get(friend.id.as_str());
                 FriendRow {
                     id: friend.id.as_str().into(),
                     name: friend.name.as_str().into(),
@@ -444,6 +447,9 @@ impl Adapter {
                         .into(),
                     activity,
                     activity_emoji,
+                    voice_room: voice.map_or("", |place| place.room).into(),
+                    voice_channel: voice.map_or("", |place| place.channel).into(),
+                    voice_server: voice.map_or("", |place| place.server).into(),
                 }
             })
             .collect();
@@ -509,13 +515,17 @@ impl Adapter {
             .into_iter()
             .enumerate()
             .map(|(index, room)| {
+                let mut folds_by = None;
                 let heading = if direct {
                     String::new()
                 } else if index < in_pinned {
                     if index == 0 { "PINNED CHANNELS" } else { "" }.into()
                 } else if room.capabilities.categories {
-                    // Discord channels sit under their categories, as in Discord.
-                    if category.replace(&room.category) != Some(&room.category) {
+                    // Discord channels sit under their categories, as in
+                    // Discord, which may share a name.
+                    let this = (room.category_id.as_deref(), room.category.as_str());
+                    if category.replace(this) != Some(this) {
+                        folds_by = room.category_id.as_deref();
                         room.category.to_uppercase()
                     } else {
                         String::new()
@@ -530,9 +540,15 @@ impl Adapter {
                     String::new()
                 };
                 let (detail, detail_emoji) = dm_detail(room);
+                let voice = room
+                    .person
+                    .as_deref()
+                    .filter(|_| room.network == Network::Discord)
+                    .and_then(|person| in_voice.get(person));
                 RoomRow {
                     id: room.id.clone().into(),
                     name: room.name.clone().into(),
+                    category: folds_by.unwrap_or(&heading).into(),
                     heading: heading.into(),
                     icon: if room.locked {
                         self.icons.lock.clone()
@@ -549,13 +565,14 @@ impl Adapter {
                     unread: room.unread > 0,
                     badge: mention_badge(room),
                     voice: room.voice,
+                    chat: room.voice_chat(),
                     direct: room.direct,
                     initial: initial(&room.name),
                     tint: tint(&room.id),
                     picture: slint::Image::default(),
                     picture_url: room.avatar.as_deref().unwrap_or_default().into(),
                     discord: room.direct && room.network == Network::Discord,
-                    locked: room.locked,
+                    locked: room.locked || room.join_locked,
                     person: room.person.is_some(),
                     pinned: if room.direct {
                         state.pinned.contains(&room.id)
@@ -605,6 +622,9 @@ impl Adapter {
                     .into(),
                     detail,
                     detail_emoji,
+                    voice_room: voice.map_or("", |place| place.room).into(),
+                    voice_channel: voice.map_or("", |place| place.channel).into(),
+                    voice_server: voice.map_or("", |place| place.server).into(),
                     thread: room.parent.is_some(),
                     ..Default::default()
                 }
@@ -624,9 +644,7 @@ impl Adapter {
             Navigation::Server(server) if query.is_empty() => {
                 let mut rows = rows;
                 let rest = rows.split_off(in_pinned);
-                let rest = with_empty_categories(rest, &self.app.categories(server), |room| {
-                    self.app.category_of(room)
-                });
+                let rest = with_empty_categories(rest, &self.app.categories(server));
                 rows.extend(match self.layout.collapsed.get(server) {
                     Some(collapsed) => fold_collapsed(
                         rest,
@@ -711,6 +729,7 @@ impl Adapter {
         let app = &self.app;
         let state = &app.state;
         window.set_can_start_threads(app.can_start_threads());
+        window.set_can_create_polls(app.can_create_polls());
         window.set_threads_can_create(state.thread_list().is_some_and(|list| {
             let (public, private) = app.thread_starts(&list.room);
             public || private
@@ -789,19 +808,38 @@ impl Adapter {
             return;
         };
         window.set_reactions_key(shown.key.as_str().into());
+        window.set_reactions_voters(shown.poll);
         window.set_reactors_loading(shown.loading);
         window.set_reactors_more(state.more_reactors());
         window.set_reactors_error(shown.error.clone().unwrap_or_default().into());
-        let pills = state
-            .window_reactions()
-            .into_iter()
-            .map(|reaction| ReactionPill {
-                key: reaction.key.as_str().into(),
-                label: emoji_of(&shown.item, &reaction.key).into(),
-                name: emoji::shortcode(&reaction.key).into(),
-                count: i32::try_from(reaction.count).unwrap_or(i32::MAX),
-            })
-            .collect();
+        let pills = if shown.poll {
+            state
+                .window_answers()
+                .iter()
+                .map(|answer| ReactionPill {
+                    key: answer.id.to_string().into(),
+                    label: answer
+                        .emoji
+                        .as_deref()
+                        .map(|key| emoji_of(&shown.item, key))
+                        .unwrap_or_default()
+                        .into(),
+                    name: answer.text.as_str().into(),
+                    count: i32::try_from(answer.votes).unwrap_or(i32::MAX),
+                })
+                .collect()
+        } else {
+            state
+                .window_reactions()
+                .into_iter()
+                .map(|reaction| ReactionPill {
+                    key: reaction.key.as_str().into(),
+                    label: emoji_of(&shown.item, &reaction.key).into(),
+                    name: emoji::shortcode(&reaction.key).into(),
+                    count: i32::try_from(reaction.count).unwrap_or(i32::MAX),
+                })
+                .collect()
+        };
         update_model(&self.models.reaction_pills, pills);
         let rows = shown
             .people
@@ -813,7 +851,7 @@ impl Adapter {
                 avatar: person.avatar.as_str().into(),
                 initial: initial(&person.name),
                 tint: tint(&person.name),
-                removable: person.me || shown.can_remove,
+                removable: !shown.poll && (person.me || shown.can_remove),
             })
             .collect();
         update_model(&self.models.reactor_rows, rows);
@@ -965,6 +1003,65 @@ impl Adapter {
         self.models.post_rows.set_vec(rows);
     }
 
+    /// The form for a post in the forum on screen.
+    fn show_new_post(&mut self, window: &YapfastWindow) {
+        let app = &self.app;
+        let state = &app.state;
+        window.set_can_post(app.can_post());
+        let post = state.new_post();
+        window.set_post_composing(post.is_some());
+        let Some(post) = post else {
+            if self.post_tags_shown.take().is_some() {
+                self.models.post_chosen_tags.set_vec(Vec::new());
+                self.models.post_tag_choices.set_vec(Vec::new());
+            }
+            return;
+        };
+        // The fields are the window's while it's open; Yapfast writes them only
+        // when they differ, so the caret stays.
+        if window.get_post_title() != post.title.as_str() {
+            window.set_post_title(post.title.as_str().into());
+        }
+        if window.get_post_body() != post.body.as_str() {
+            window.set_post_body(post.body.as_str().into());
+        }
+        let info = app.forum_info(&post.room).unwrap_or_default();
+        window.set_post_tag_required(info.require_tag);
+        window.set_post_more_tags(post.tags.len() < yapfast_core::application::POST_TAGS);
+        let topic = state.topic.as_ref();
+        window.set_post_has_guidelines(topic.is_some_and(|topic| !topic.body.trim().is_empty()));
+        if !matches!((topic, &self.guidelines_shown), (Some(topic), Some(shown)) if Arc::ptr_eq(topic, shown))
+        {
+            self.guidelines_shown = topic.cloned();
+            window.set_post_guidelines(topic.map_or_else(slint::StyledText::default, |topic| {
+                super::messages::topic_text(topic, false)
+            }));
+        }
+        window.set_posting(post.posting);
+        window.set_post_error(post.error.as_deref().unwrap_or_default().into());
+        window.set_post_leaving(post.leaving);
+        let tags = app.post_tags(&post.room);
+        let shown = (tags.clone(), post.tags.clone());
+        if self.post_tags_shown.as_ref() == Some(&shown) {
+            return;
+        }
+        let choice = |tag: &yapfast_core::chat::ForumTag| PostTagChoice {
+            id: tag.id.as_str().into(),
+            tag: post_tag(&tag.name, tag.emoji.as_ref()),
+            chosen: post.tags.contains(&tag.id),
+        };
+        let chosen: Vec<PostTagChoice> = post
+            .tags
+            .iter()
+            .filter_map(|id| tags.iter().find(|tag| &tag.id == id))
+            .map(choice)
+            .collect();
+        let choices: Vec<PostTagChoice> = tags.iter().map(choice).collect();
+        self.models.post_chosen_tags.set_vec(chosen);
+        self.models.post_tag_choices.set_vec(choices);
+        self.post_tags_shown = Some(shown);
+    }
+
     /// The open conversation's header.
     fn show_header(&mut self, window: &YapfastWindow) {
         let state = &self.app.state;
@@ -1031,7 +1128,11 @@ impl Adapter {
                 .menu_choices(id)
                 .contains(&yapfast_core::application::MenuChoice::ChannelNotifications)
         }));
-        let topic = state.topic.as_ref();
+        // A forum's topic is its post guidelines, which the form shows.
+        let topic = state
+            .topic
+            .as_ref()
+            .filter(|_| !room.is_some_and(|room| room.forum));
         window.set_has_topic(topic.is_some());
         let same = match (topic, &self.topic_shown) {
             (Some(topic), Some(shown)) => Arc::ptr_eq(topic, shown),
@@ -1734,6 +1835,7 @@ impl Adapter {
             _ => SharedString::default(),
         });
         self.show_person_dialog(window);
+        self.show_poll_draft(window);
         let editor = state.status_editor.as_ref();
         // Opening the dialog starts from the status there is.
         if editor.is_some() && !window.get_status_open() {
@@ -1964,7 +2066,10 @@ impl Adapter {
         let state = &self.app.state;
         let room = state.selected_room();
         window.set_voice_room(room.is_some_and(|room| room.voice));
+        window.set_voice_chat(state.voice_chat);
+        window.set_has_voice_chat(room.is_some_and(|room| room.voice_chat()));
         window.set_room_encrypted(room.is_some_and(|room| room.encrypted));
+        window.set_call_encrypted(room.is_some_and(|room| room.call_encrypted()));
         window.set_room_ready(state.room_ready);
         window.set_draft(state.draft().into());
         let discord_room = room.is_some_and(|room| room.network == Network::Discord);
@@ -1972,11 +2077,12 @@ impl Adapter {
         window.set_composer_enabled(
             state.room_ready
                 && !state.busy
+                && state.shows_text()
                 && room.is_some_and(|room| {
                     if discord_room {
                         state.writable(room)
                     } else {
-                        !room.voice && (state.preview || room.encrypted)
+                        state.preview || room.encrypted
                     }
                 }),
         );
@@ -2014,6 +2120,9 @@ impl Adapter {
         }
         update_model(&self.models.staged, rows);
         window.set_confirm_delete(state.confirm_delete.clone().unwrap_or_default().into());
+        window
+            .global::<Polls>()
+            .set_confirm_end(state.confirm_end_poll.clone().unwrap_or_default().into());
         window.set_reply_ping(matches!(
             state.compose(),
             Some(Compose::Reply { ping: true, .. })
@@ -2173,6 +2282,12 @@ impl Adapter {
             }
         }
         let state = &self.app.state;
+        // A poll's time left counts down by the minute.
+        let minute = yapfast_core::clock::now_ms() / 60_000;
+        if self.poll_minute != minute {
+            self.poll_minute = minute;
+            self.restyle |= polls::open_poll(&state.messages, minute * 60);
+        }
         let restyle = std::mem::take(&mut self.restyle);
         // The thread beside builds its rows again with the timeline's.
         self.aside_restyle |= restyle;
@@ -2263,7 +2378,19 @@ impl Adapter {
     /// ringing, and the devices.
     fn show_voice(&mut self, window: &YapfastWindow) {
         self.ring();
+        // The server of a call shows it on the rail, so the rail follows a
+        // call that starts, ends or moves; other voice events leave it be.
         let state = &self.app.state;
+        if self.rail_call.as_deref() != call_room(state) {
+            self.rail_call = call_room(state).map(str::to_owned);
+            let rooms_by_id = state
+                .rooms
+                .iter()
+                .map(|room| (room.id.as_str(), room))
+                .collect();
+            let rail = rail(state, &rooms_by_id, &self.layout.open_folders);
+            update_model_by_id(&self.models.servers, rail, |row| row.id.clone());
+        }
         let timed = matches!(state.voice.phase, Phase::Connected | Phase::Reconnecting)
             .then(|| state.voice.room.clone())
             .flatten();
@@ -2686,10 +2813,15 @@ impl Adapter {
             if let Some(room) = state.selected_room() {
                 data.presence = presence_name(room.presence.or(view.profile.presence)).into();
                 if let Some(activity) = &room.activity {
-                    let (emoji, activity) = yapfast_core::discord::status_parts(activity);
+                    let (emoji, activity) = if names_an_activity(activity, &room.activities) {
+                        (None, "")
+                    } else {
+                        yapfast_core::discord::status_parts(activity)
+                    };
                     data.activity = activity.into();
                     data.activity_emoji = emoji.unwrap_or_default().into();
                 }
+                data.activities = activity_rows(&room.activities);
             }
             let shown = window.get_panel_profile();
             if let Some(data) = changed_profile(&shown, data) {
@@ -2698,6 +2830,7 @@ impl Adapter {
         }
         let Some(view) = &state.profile else {
             window.set_profile_member(SharedString::default());
+            self.tick_activities(window);
             return;
         };
         window.set_profile_large(view.large);
@@ -2710,6 +2843,7 @@ impl Adapter {
         if let Some(data) = changed_profile(&window.get_profile(), data) {
             window.set_profile(data);
         }
+        self.tick_activities(window);
     }
 
     /// The image viewer: the full image once it arrives, the preview until then.
@@ -2894,6 +3028,23 @@ pub(super) fn unread_dm_rows(state: &AppState) -> Vec<ServerRow> {
         .collect()
 }
 
+/// The whole rail: unread DMs, a line, then the servers and folders. Unread
+/// DMs come and go above the servers, so the model keeps rows by id rather
+/// than all moving down one.
+fn rail(
+    state: &AppState,
+    rooms_by_id: &HashMap<&str, &yapfast_core::chat::ChatRoom>,
+    open_folders: &std::collections::BTreeSet<String>,
+) -> Vec<ServerRow> {
+    let mut rail = unread_dm_rows(state);
+    rail.push(ServerRow {
+        divider: true,
+        ..Default::default()
+    });
+    rail.extend(rail_rows(state, rooms_by_id, open_folders));
+    rail
+}
+
 /// The rail's rows: each server, and each folder with its servers after it
 /// while it's open.
 pub(super) fn rail_rows(
@@ -2918,12 +3069,19 @@ pub(super) fn rail_rows(
     let selected = |server: &yapfast_core::chat::ChatServer| {
         state.navigation == Navigation::Server(server.id.clone())
     };
+    let call = call_room(state);
+    let in_call = |server: &yapfast_core::chat::ChatServer| {
+        call.is_some_and(|room| server.channels.iter().any(|channel| channel == room))
+    };
     let mut rows = Vec::with_capacity(state.servers.len());
     let mut servers = state.servers.iter().peekable();
     while let Some(server) = servers.next() {
         let Some(folder) = &server.folder else {
             let (unread, mentions) = marks(server);
-            rows.push(server_row(server, selected(server), unread, mentions));
+            rows.push(ServerRow {
+                call: in_call(server),
+                ..server_row(server, selected(server), unread, mentions)
+            });
             continue;
         };
         let mut inside = vec![server];
@@ -2958,6 +3116,7 @@ pub(super) fn rail_rows(
             selected: inside.iter().any(|server| selected(server)),
             unread,
             badge: count_badge(mentions),
+            call: inside.iter().any(|server| in_call(server)),
             discord: true,
             folder: true,
             open,
@@ -2982,12 +3141,56 @@ pub(super) fn rail_rows(
                     nested: true,
                     last: index == last,
                     tint,
+                    call: in_call(server),
                     ..server_row(server, selected(server), unread, mentions)
                 });
             }
         }
     }
     rows
+}
+
+/// The voice channel of the call going on, if there is one.
+/// A server voice channel someone is in, as the friends list names it.
+pub(super) struct VoicePlace<'a> {
+    pub room: &'a str,
+    pub channel: &'a str,
+    pub server: &'a str,
+}
+
+/// Who is in a voice channel of a server this account is in, by user id.
+/// DM calls stay out: Discord's friends list shows only servers' channels.
+pub(super) fn voice_places<'a>(
+    state: &'a AppState,
+    rooms_by_id: &HashMap<&str, &'a yapfast_core::chat::ChatRoom>,
+) -> HashMap<&'a str, VoicePlace<'a>> {
+    let mut places = HashMap::new();
+    for server in &state.servers {
+        for channel in &server.channels {
+            let Some(room) = rooms_by_id.get(channel.as_str()).filter(|room| room.voice) else {
+                continue;
+            };
+            for person in &room.people {
+                places.insert(
+                    person.id.as_str(),
+                    VoicePlace {
+                        room: &room.id,
+                        channel: &room.name,
+                        server: &server.name,
+                    },
+                );
+            }
+        }
+    }
+    places
+}
+
+fn call_room(state: &AppState) -> Option<&str> {
+    state
+        .voice
+        .active()
+        .then_some(state.voice.room.as_deref())
+        .flatten()
 }
 
 /// Discord's colour for a folder that wasn't given one.
@@ -3026,7 +3229,7 @@ pub(super) fn fold_collapsed(
     let mut folded = Vec::with_capacity(rows.len());
     for mut row in rows {
         if !row.heading.is_empty() {
-            group = row.heading.clone();
+            group = row.category.clone();
         }
         if group.is_empty() || !collapsed.contains(group.as_str()) {
             folded.push(row);
@@ -3045,6 +3248,7 @@ pub(super) fn fold_collapsed(
             folded.push(RoomRow {
                 id: row.id,
                 heading: row.heading,
+                category: row.category,
                 collapsed: true,
                 hidden: true,
                 ..Default::default()
@@ -3059,7 +3263,6 @@ pub(super) fn fold_collapsed(
 pub(super) fn with_empty_categories(
     rows: Vec<RoomRow>,
     categories: &[ListedCategory],
-    category_of: impl Fn(&str) -> Option<String>,
 ) -> Vec<RoomRow> {
     if !categories.iter().any(|category| category.empty) {
         return rows;
@@ -3068,6 +3271,7 @@ pub(super) fn with_empty_categories(
     let heading = |category: &ListedCategory| RoomRow {
         id: category.id.as_str().into(),
         heading: category.name.to_uppercase().into(),
+        category: category.id.as_str().into(),
         hidden: true,
         ..Default::default()
     };
@@ -3075,10 +3279,9 @@ pub(super) fn with_empty_categories(
     let mut listed = Vec::with_capacity(rows.len() + categories.len());
     for row in rows {
         if !row.heading.is_empty()
-            && let Some(category) = category_of(&row.id)
             && let Some(at) = categories[next..]
                 .iter()
-                .position(|known| known.id == category)
+                .position(|known| known.id == row.category.as_str())
         {
             listed.extend(
                 categories[next..next + at]
@@ -3289,6 +3492,20 @@ fn thread_row(thread: &yapfast_core::chat::ListedThread, now: u64) -> ThreadRow 
     }
 }
 
+/// A forum's tag, or an emoji, as a card or the form for a post shows it.
+fn post_tag(name: &str, emoji: Option<&yapfast_core::chat::ShownEmoji>) -> PostTag {
+    PostTag {
+        name: name.into(),
+        emoji: emoji
+            .filter(|emoji| emoji.picture.is_none())
+            .map_or(SharedString::default(), |emoji| emoji.text.as_str().into()),
+        emoji_url: emoji
+            .and_then(|emoji| emoji.picture.as_deref())
+            .unwrap_or_default()
+            .into(),
+    }
+}
+
 /// A forum post as its card shows it, as Discord's client does: its first
 /// three tags, its first message's author and text, its top reaction or the
 /// forum's own, its replies, and when it was last active, or made when the
@@ -3300,16 +3517,7 @@ fn post_row(
 ) -> PostRow {
     const TAGS: usize = 3;
     let thread = &post.thread;
-    let tag = |name: &str, emoji: Option<&yapfast_core::chat::ShownEmoji>| PostTag {
-        name: name.into(),
-        emoji: emoji
-            .filter(|emoji| emoji.picture.is_none())
-            .map_or(SharedString::default(), |emoji| emoji.text.as_str().into()),
-        emoji_url: emoji
-            .and_then(|emoji| emoji.picture.as_deref())
-            .unwrap_or_default()
-            .into(),
-    };
+    let tag = post_tag;
     let tags: Vec<PostTag> = post
         .tags
         .iter()
