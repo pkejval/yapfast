@@ -538,7 +538,7 @@ fn normalize(input: &Value, client: &str, name: &str, assets: Option<&Assets>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activity::merge;
+    use crate::game_activity::merge;
 
     struct Directory(PathBuf);
     impl Directory {

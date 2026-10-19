@@ -197,9 +197,9 @@ fn voice_person(member: &yapfast_discord::service::VoiceMember) -> VoicePerson {
 /// text channels before voice channels in each, and the latest DM first.
 /// They stay listed while Discord reconnects; joining and sending wait for
 /// the connection. Voice channels this account can see but not join are
-/// listed locked, as in Discord, and text channels it can't send in are
-/// read-only. Channels hidden from it are listed locked only with
-/// `show_hidden`.
+/// listed locked, as in Discord, though their chat may be read, and
+/// channels it can't send in are read-only. Channels hidden from it are
+/// listed locked only with `show_hidden`.
 pub fn index(snapshot: &Snapshot, show_hidden: bool) -> (Vec<ChatRoom>, Vec<ChatServer>) {
     let mut index = Index::default();
     index.update(snapshot, show_hidden);
@@ -496,6 +496,7 @@ pub fn forum_tags(forum: &yapfast_discord::forum::Forum) -> Vec<chat::ForumTag> 
             id: tag.id.clone(),
             name: tag.name.clone(),
             emoji: tag.emoji.as_ref().map(shown_emoji),
+            moderated: tag.moderated,
         })
         .collect()
 }
@@ -531,6 +532,7 @@ fn dm_rooms(snapshot: &Snapshot, premium: u8, me: &str) -> Vec<ChatRoom> {
             muted: dm.muted,
             last_read: read_item(dm.last_read),
             locked: false,
+            join_locked: false,
             // Replying waits until the request is accepted.
             read_only: dm.request,
             slowed: false,
@@ -540,6 +542,7 @@ fn dm_rooms(snapshot: &Snapshot, premium: u8, me: &str) -> Vec<ChatRoom> {
                 _ => "",
             }
             .into(),
+            category_id: None,
             request: dm.request,
             person: dm.person.clone(),
             people: in_voice(snapshot, &dm.id),
@@ -554,6 +557,7 @@ fn dm_rooms(snapshot: &Snapshot, premium: u8, me: &str) -> Vec<ChatRoom> {
             upload_limit: yapfast_discord::api::upload_limit(premium, None),
             presence: dm.presence.map(presence),
             activity: dm.activity.clone(),
+            activities: dm.activities.clone(),
             parent: None,
             forum: false,
             preview: dm.preview.as_ref().map(|preview| {
@@ -627,10 +631,21 @@ fn server_rooms(
         .map(|(_, _, channel)| room_id(&server.id, channel))
         .collect();
     let mut channels = Vec::new();
+    // A category's channels come together, and share its room id.
+    let mut shared: Option<(&str, Arc<str>)> = None;
     for (voice, channel) in listed {
         let id = room_id(&server.id, &channel.id);
-        let category = server
-            .category(channel)
+        let category = server.category(channel);
+        let category_id = category
+            .and(channel.parent.as_deref())
+            .map(|parent| match &shared {
+                Some((known, id)) if *known == parent => id.clone(),
+                _ => shared
+                    .insert((parent, room_id(&server.id, parent).into()))
+                    .1
+                    .clone(),
+            });
+        let category = category
             .map(|category| category.name.clone())
             .unwrap_or_default();
         rooms.push(if voice {
@@ -641,20 +656,23 @@ fn server_rooms(
                 name: channel.name.clone(),
                 direct: false,
                 voice: true,
-                // Discord requires DAVE end-to-end encryption in voice calls.
-                encrypted: true,
+                // Its chat isn't end-to-end encrypted, as no Discord
+                // channel's is; its calls are, as `call_encrypted` says.
+                encrypted: false,
                 members: snapshot
                     .voice
                     .get(&channel.id)
                     .map_or(0, |members| members.len() as u64),
-                unread: 0,
-                mentions: 0,
-                muted: false,
-                last_read: None,
-                locked: channel.access != Access::Join,
-                read_only: false,
-                slowed: false,
+                unread: u64::from(channel.unread),
+                mentions: channel.mentions,
+                muted: channel.muted,
+                last_read: read_item(channel.last_read),
+                locked: channel.access == Access::Hidden,
+                join_locked: channel.access != Access::Join,
+                read_only: !server.may_send(channel, me, &server.my_roles),
+                slowed: server.slowed(channel, me, &server.my_roles),
                 category,
+                category_id: category_id.clone(),
                 request: false,
                 person: None,
                 people: in_voice(snapshot, &channel.id),
@@ -663,6 +681,7 @@ fn server_rooms(
                 avatar: None,
                 presence: None,
                 activity: None,
+                activities: Default::default(),
                 upload_limit: yapfast_discord::api::upload_limit(
                     premium,
                     Some(server.premium_tier),
@@ -693,9 +712,11 @@ fn server_rooms(
                 muted: channel.muted,
                 last_read: read_item(channel.last_read),
                 locked: channel.access == Access::Hidden,
+                join_locked: false,
                 read_only: channel.access == Access::Locked,
                 slowed: server.slowed(channel, me, &server.my_roles),
                 category,
+                category_id: category_id.clone(),
                 request: false,
                 person: None,
                 people: vec![],
@@ -704,6 +725,7 @@ fn server_rooms(
                 avatar: None,
                 presence: None,
                 activity: None,
+                activities: Default::default(),
                 upload_limit: yapfast_discord::api::upload_limit(
                     premium,
                     Some(server.premium_tier),
@@ -762,10 +784,12 @@ fn thread_room(
         muted: thread.muted,
         last_read: read_item(thread.last_read),
         locked: false,
+        join_locked: false,
         // Locked, or this account may not write in threads here.
         read_only: thread.access == Access::Locked,
         slowed: server.slowed(thread, me, &server.my_roles),
         category: parent.category.clone(),
+        category_id: parent.category_id.clone(),
         request: false,
         person: None,
         people: vec![],
@@ -774,6 +798,7 @@ fn thread_room(
         avatar: None,
         presence: None,
         activity: None,
+        activities: Default::default(),
         upload_limit: yapfast_discord::api::upload_limit(premium, Some(server.premium_tier)),
         parent: Some(parent.id.clone()),
         forum: false,
@@ -1291,7 +1316,7 @@ mod tests {
         assert!(rooms[1].read_only && !rooms[1].locked);
         assert_eq!(rooms[2].id, "discord:10:11");
         assert!(rooms[2].voice && !rooms[2].locked);
-        assert!(rooms[3].locked);
+        assert!(rooms[3].join_locked && !rooms[3].locked);
         assert_eq!(rooms.len(), 4, "hidden channels stay hidden");
         assert_eq!(servers[0].id, "discord:10");
         assert_eq!(servers[0].icon.as_deref(), Some("icon.png"));

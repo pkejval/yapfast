@@ -915,6 +915,103 @@ async fn talks_to_the_fake_server() {
     // showed it, does what was asked.
     discord.delete(&general, &sent.id).await.unwrap();
 
+    // Polls: a vote comes back live, who voted lists by answer, and Alice's
+    // own poll ends early with a notice of its winner.
+    let posted = control
+        .post(format!("{server}/_control/poll?alice"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let poll = live_where(&mut live, |event| match event {
+        Live::Created(message) if message.poll.is_some() => Some(message),
+        _ => None,
+    })
+    .await;
+    assert_eq!(poll.id, posted.trim());
+    assert!(!poll.editable && !poll.forwardable);
+    discord.vote(&general, &poll.id, &[2]).await.unwrap();
+    live_where(&mut live, |event| match event {
+        Live::Vote {
+            answer: 2,
+            me: true,
+            added: true,
+            ..
+        } => Some(()),
+        _ => None,
+    })
+    .await;
+    let voters = discord
+        .voters(&guild, &general, &poll.id, 2, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(voters.len(), 3);
+    assert_eq!(voters.iter().filter(|voter| voter.me).count(), 1);
+    discord.end_poll(&general, &poll.id).await.unwrap();
+    let closed = live_where(&mut live, |event| match event {
+        Live::Updated(message) if message.id == poll.id => Some(message),
+        _ => None,
+    })
+    .await;
+    assert!(closed.poll.is_some_and(|poll| poll.finalized));
+    let notice = live_where(&mut live, |event| match event {
+        Live::Created(message) if message.system.is_some() => Some(message),
+        _ => None,
+    })
+    .await;
+    assert!(
+        notice
+            .system
+            .as_deref()
+            .is_some_and(|said| said.ends_with("Winning answer: 🍜 Ramen, 3 votes (75%).")),
+        "{notice:?}"
+    );
+
+    // Posting a poll, as Discord's "Create a Poll" dialog does.
+    let new_poll = yapfast_discord::api::NewPoll {
+        question: "Movie tonight?".into(),
+        answers: vec![
+            yapfast_discord::api::NewAnswer {
+                text: "Yes".into(),
+                emoji: Some("🍿".into()),
+            },
+            yapfast_discord::api::NewAnswer {
+                text: "No".into(),
+                emoji: None,
+            },
+        ],
+        hours: 4,
+        multiselect: false,
+    };
+    discord
+        .send_poll(&guild, &general, &new_poll)
+        .await
+        .unwrap();
+    let posted = live_where(&mut live, |event| match event {
+        Live::Created(message) => message
+            .poll
+            .filter(|poll| poll.question == "Movie tonight?"),
+        _ => None,
+    })
+    .await;
+    let answers: Vec<_> = posted
+        .answers
+        .iter()
+        .map(|answer| (answer.id, answer.text.as_str(), answer.emoji.clone()))
+        .collect();
+    assert_eq!(
+        answers,
+        [(1, "Yes", Some(("🍿".to_owned(), None))), (2, "No", None)]
+    );
+    let expiry = posted.expiry.unwrap();
+    let now = yapfast_discord::message::snowflake_ms(&yapfast_discord::message::nonce());
+    assert!(
+        expiry.abs_diff(now + 4 * 3_600_000) < 60_000,
+        "it takes votes for four hours"
+    );
+
     // Forwarding, as Discord's client does: a message of its own that
     // carries the original, then the message added as another.
     discord
@@ -2896,6 +2993,7 @@ async fn talks_to_the_fake_server() {
     lists_who_reacted_as_discords_client_does(&discord, server, &guild, &general).await;
     finds_gifs_as_discords_client_does(&discord, server, &guild, &general).await;
     starts_threads_as_discords_client_does(&discord, server, &guild, &general).await;
+    posts_in_a_forum_as_discords_client_does(&discord, server, &guild).await;
 
     // Leaving "Server", which Bob owns, takes it out of her list; the fake
     // lets her back in, so the tests after these find it again.
@@ -3115,6 +3213,83 @@ async fn shows_a_forum_as_discords_client_does(discord: &Discord, server: &str, 
         .find(|thread| thread.name == "Emoji picker search")
         .unwrap();
     assert_eq!(new.thread.as_deref().unwrap().tags, [details_tag(forum, 0)]);
+}
+
+async fn posts_in_a_forum_as_discords_client_does(discord: &Discord, server: &str, guild: &str) {
+    let forum = |snapshot: &Snapshot| {
+        snapshot.servers[0]
+            .text_channels
+            .iter()
+            .find(|channel| channel.name == "ideas")
+            .cloned()
+            .unwrap()
+    };
+    // A forum that requires a tag refuses a post without one.
+    post_control(server, "/_control/forum-require-tag", "");
+    let snapshot = snapshot_where(discord, |snapshot| {
+        forum(snapshot)
+            .forum
+            .as_deref()
+            .is_some_and(|forum| forum.require_tag)
+    })
+    .await;
+    let ideas = forum(&snapshot);
+    let refused = discord
+        .post_in_forum(guild, &ideas.id, "Untagged", &[], "Hello", vec![])
+        .await;
+    assert!(refused.is_err_and(|error| error.to_string().contains("tag is required")));
+
+    // A post with a tag, text and a file lists, its first message with
+    // them, as Discord sends it.
+    let bug = details_tag(&ideas, 1);
+    let post = discord
+        .post_in_forum(
+            guild,
+            &ideas.id,
+            "Crash when dragging",
+            std::slice::from_ref(&bug),
+            "It closes.",
+            vec![("notes.txt".into(), b"steps".to_vec())],
+        )
+        .await
+        .unwrap();
+    let snapshot = snapshot_where(discord, |snapshot| {
+        snapshot.servers[0]
+            .threads
+            .iter()
+            .any(|thread| thread.id == post)
+    })
+    .await;
+    let listed = snapshot.servers[0]
+        .threads
+        .iter()
+        .find(|thread| thread.id == post)
+        .unwrap();
+    assert_eq!(listed.name, "Crash when dragging");
+    assert_eq!(listed.parent.as_deref(), Some(ideas.id.as_str()));
+    assert_eq!(
+        listed.thread.as_deref().unwrap().tags,
+        std::slice::from_ref(&bug)
+    );
+    let first = discord
+        .history(guild, &post, Span::Latest)
+        .await
+        .unwrap()
+        .messages;
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].id, post, "the first message has the post's id");
+    assert_eq!(first[0].content, "It closes.");
+    assert_eq!(first[0].attachments.len(), 1);
+    assert_eq!(first[0].attachments[0].name, "notes.txt");
+    let creates: serde_json::Value =
+        serde_json::from_str(&control(server, "GET", "/_control/thread-creates", "")).unwrap();
+    let body = creates.as_array().unwrap().last().unwrap();
+    assert_eq!(body["name"], "Crash when dragging");
+    assert_eq!(body["applied_tags"], serde_json::json!([bug]));
+    assert_eq!(body["auto_archive_duration"], 4320);
+    assert_eq!(body["message"]["content"], "It closes.");
+    assert_eq!(body["message"]["attachments"][0]["filename"], "notes.txt");
+    post_control(server, "/_control/forum-require-tag?off", "");
 }
 
 /// The id of a forum's `index`th tag.

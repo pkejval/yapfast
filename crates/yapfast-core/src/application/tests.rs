@@ -269,6 +269,7 @@ fn members_belong_to_the_selected_text_room() {
         presence: None,
         color: None,
         activity: None,
+        activities: Default::default(),
         roles: Default::default(),
         timed_out_until: None,
     };
@@ -1608,6 +1609,77 @@ fn clicking_a_voice_channel_joins_it_and_asks_before_leaving_another() {
 }
 
 #[test]
+fn a_discord_voice_channels_chat_opens_without_joining_it() {
+    let mut app = connected();
+    let id = "discord:10:11";
+    let mut room = preview_room(id, "Lounge", false, 3);
+    room.voice = true;
+    room.join_locked = true;
+    app.state.discord_online = true;
+    app.state.rooms.push(room);
+    app.state.servers[0].channels.push(id.into());
+    let opens = |effects: &[Effect]| {
+        effects.iter().any(|effect| {
+            matches!(
+                effect, Effect::Backend(Command::Open(room)) if room == id
+            )
+        })
+    };
+
+    // Going to it shows its call, and loads no messages.
+    let effects = app.dispatch(Action::Open(id.into()));
+    assert!(!opens(&effects));
+    assert!(!app.state.shows_text() && !app.state.can_write());
+    assert!(app.dispatch(Action::Earlier).is_empty());
+    assert!(app.state.menu_choices(id).contains(&MenuChoice::OpenChat));
+
+    // Its chat opens without joining, which its roles don't allow.
+    let effects = app.dispatch(Action::OpenChat(id.into()));
+    assert!(opens(&effects));
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Backend(Command::Voice(_))))
+    );
+    assert!(app.state.voice_chat && !app.state.can_join_voice(id));
+    app.apply(Event::Timeline {
+        room: id.into(),
+        messages: timeline(vec![]),
+    });
+    assert!(app.state.can_write());
+    app.dispatch(Action::SetDraft("Hello from voice chat".into()));
+    assert!(matches!(
+        send_command(app.dispatch(Action::Send)),
+        Command::Send { room, body, .. } if room == id && body == "Hello from voice chat"
+    ));
+    assert!(app.dispatch(Action::Earlier).iter().any(|effect| matches!(
+        effect, Effect::Backend(Command::Earlier(room)) if room == id
+    )));
+
+    // The header switches back to its call and to its chat again.
+    let effects = app.dispatch(Action::ShowVoiceChat(false));
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Backend(Command::CloseRoom)))
+    );
+    assert!(!app.state.voice_chat && !app.state.can_write());
+    assert!(opens(&app.dispatch(Action::ShowVoiceChat(true))));
+    assert!(
+        app.state.voice_chat && app.state.room_ready,
+        "its messages stay"
+    );
+
+    app.state
+        .rooms
+        .iter_mut()
+        .find(|room| room.id == id)
+        .unwrap()
+        .read_only = true;
+    assert!(!app.state.can_write());
+}
+
+#[test]
 fn menus_offer_what_fits_their_conversation_or_server() {
     use MenuChoice::*;
     let mut app = connected();
@@ -1692,6 +1764,7 @@ fn a_discord_dms_menu_manages_its_person_and_notifications() {
                 nickname: Some("Annie".into()),
                 presence: None,
                 activity: None,
+                activities: Default::default(),
             }]
         } else {
             vec![]
@@ -2608,6 +2681,7 @@ fn member(id: &str, name: &str) -> ChatMember {
         presence: None,
         color: None,
         activity: None,
+        activities: Default::default(),
         roles: Default::default(),
         timed_out_until: None,
     }
@@ -3325,6 +3399,7 @@ fn matrix_profiles_show_what_the_member_list_knows() {
             presence: None,
             color: None,
             activity: None,
+            activities: Default::default(),
             roles: Default::default(),
             timed_out_until: None,
         }]),
@@ -3445,6 +3520,7 @@ fn discord_friends_are_listed_and_messaged() {
         nickname: None,
         presence,
         activity: None,
+        activities: Default::default(),
     };
     let snapshot = |dms: &[(&str, &str)]| Snapshot {
         status: Status::Online,
@@ -3453,6 +3529,7 @@ fn discord_friends_are_listed_and_messaged() {
         friend_list: vec![
             Friend {
                 activity: Some("making tea".into()),
+                activities: Default::default(),
                 ..friend("2", "Ann", Some(Discord::Idle))
             },
             friend("3", "Bob", None),
@@ -3480,6 +3557,7 @@ fn discord_friends_are_listed_and_messaged() {
             avatar: Some("2.png".into()),
             presence: Some(chat::Presence::Idle),
             activity: Some("making tea".into()),
+            activities: Default::default(),
         }
     );
     let effects = app.dispatch(Action::OpenDmScreen(DmScreen::Friends));
@@ -4725,6 +4803,7 @@ fn discord_dms(extra: Vec<yapfast_discord::service::Conversation>) -> Applicatio
         nickname: None,
         presence: None,
         activity: None,
+        activities: Default::default(),
     };
     let mut conversations = vec![
         Conversation {
@@ -6423,6 +6502,155 @@ fn a_channels_threads_list_as_discords_client_lists_them() {
 
 #[test]
 #[cfg(feature = "discord")]
+fn a_poll_is_made_in_discords_dialog_where_polls_may_go() {
+    use crate::chat::{NewPoll, NewPollAnswer};
+    use yapfast_discord::{
+        ready::{self, permission},
+        service::{Snapshot, Status},
+    };
+    let bits = |bits: u64| bits.to_string();
+    let server = ready::server(&serde_json::json!({
+        "id": "10", "owner_id": "99", "properties": {"name": "Test"},
+        "roles": [{"id": "10", "name": "@everyone", "position": 0, "permissions": bits(
+            permission::VIEW_CHANNEL | permission::SEND_MESSAGES | permission::SEND_POLLS)}],
+        "channels": [
+            {"id": "11", "type": 0, "name": "general", "position": 0},
+            {"id": "14", "type": 0, "name": "quiet", "position": 1,
+             "permission_overwrites": [{"id": "10", "type": 0, "allow": "0",
+                                        "deny": bits(permission::SEND_POLLS)}]},
+        ],
+    }))
+    .unwrap();
+    let mut app = Application::default();
+    app.apply(Event::Discord(Arc::new(Snapshot {
+        status: Status::Online,
+        user_id: Some("1".into()),
+        servers: vec![Arc::new(server)],
+        ..Default::default()
+    })));
+    app.dispatch(Action::Navigate(Navigation::Server("discord:10".into())));
+    let open = |app: &mut Application, room: &str| {
+        app.dispatch(Action::SelectRoom(room.into()));
+        app.apply(Event::Timeline {
+            room: room.into(),
+            messages: timeline(vec![]),
+        });
+    };
+    open(&mut app, "discord:10:14");
+    assert!(!app.can_create_polls(), "Send Polls is denied there");
+    app.dispatch(Action::OpenPollDraft);
+    assert!(app.state.poll_draft.is_none());
+    let general = "discord:10:11".to_owned();
+    open(&mut app, &general);
+    assert!(app.can_create_polls());
+
+    // It starts with two answers to fill, for a day.
+    app.dispatch(Action::OpenPollDraft);
+    let draft = |app: &Application| app.state.poll_draft.clone().unwrap();
+    assert_eq!(draft(&app).answers.len(), 2);
+    assert_eq!(POLL_HOURS[draft(&app).duration], 24);
+    assert!(!draft(&app).can_post(), "it has no question yet");
+    let edit = |app: &mut Application, edit: PollEdit| app.dispatch(Action::EditPoll(edit));
+    edit(&mut app, PollEdit::Question(" Lunch? ".into()));
+    edit(
+        &mut app,
+        PollEdit::Answer {
+            index: 1,
+            text: "Soup".into(),
+        },
+    );
+    assert!(draft(&app).can_post(), "one answer is enough");
+    edit(
+        &mut app,
+        PollEdit::Answer {
+            index: 0,
+            text: "x".repeat(56),
+        },
+    );
+    assert_eq!(
+        draft(&app).problem(),
+        Some("Answers can be at most 55 characters.")
+    );
+    assert!(!draft(&app).can_post());
+    edit(
+        &mut app,
+        PollEdit::Answer {
+            index: 0,
+            text: "Pizza".into(),
+        },
+    );
+    edit(
+        &mut app,
+        PollEdit::Emoji {
+            index: 0,
+            emoji: Some("🍕".into()),
+        },
+    );
+
+    // Ten answers at most, and one stays.
+    for _ in 0..10 {
+        edit(&mut app, PollEdit::AddAnswer);
+    }
+    assert_eq!(draft(&app).answers.len(), POLL_ANSWERS);
+    assert!(!draft(&app).can_add());
+    let ids: Vec<u32> = draft(&app).answers.iter().map(|answer| answer.id).collect();
+    edit(&mut app, PollEdit::RemoveAnswer(1));
+    let kept: Vec<u32> = draft(&app).answers.iter().map(|answer| answer.id).collect();
+    assert_eq!(
+        kept,
+        [&ids[..1], &ids[2..]].concat(),
+        "the others keep their ids"
+    );
+    edit(
+        &mut app,
+        PollEdit::Answer {
+            index: 1,
+            text: "Soup".into(),
+        },
+    );
+    edit(&mut app, PollEdit::Duration(6));
+    edit(&mut app, PollEdit::Multiselect(true));
+
+    // Posting leaves out the empty answers, and keeps the dialog till
+    // Discord answers.
+    let posted = app.dispatch(Action::PostPoll);
+    let expected = NewPoll {
+        question: "Lunch?".into(),
+        answers: vec![
+            NewPollAnswer {
+                text: "Pizza".into(),
+                emoji: Some("🍕".into()),
+            },
+            NewPollAnswer {
+                text: "Soup".into(),
+                emoji: None,
+            },
+        ],
+        hours: 336,
+        multiselect: true,
+    };
+    assert!(matches!(
+        posted.as_slice(),
+        [Effect::Backend(Command::SendPoll { room, poll })] if *room == general && *poll == expected
+    ));
+    assert!(draft(&app).posting && !draft(&app).can_post());
+    assert!(app.dispatch(Action::PostPoll).is_empty(), "once");
+    app.apply(Event::PollPosted {
+        room: general.clone(),
+        result: Err("no".into()),
+    });
+    assert_eq!(draft(&app).error.as_deref(), Some("no"));
+    assert!(!draft(&app).posting);
+    app.dispatch(Action::PostPoll);
+    app.apply(Event::PollPosted {
+        room: general.clone(),
+        result: Ok(()),
+    });
+    assert!(app.state.poll_draft.is_none());
+}
+
+#[test]
+#[cfg(feature = "discord")]
 fn a_thread_starts_from_discords_new_thread_form() {
     use yapfast_discord::{
         ready::{self, permission},
@@ -6723,6 +6951,114 @@ fn a_reactions_tooltip_and_window_ask_for_who_reacted() {
     assert!(app.state.reactions.as_ref().unwrap().people.is_empty());
     app.dispatch(Action::CloseReactions);
     assert!(app.state.reactions.is_none());
+}
+
+#[test]
+fn votes_go_to_discord_and_the_window_lists_who_voted() {
+    use crate::chat::{Poll, PollAnswer};
+    let mut app = connected();
+    let answer = |id, votes, mine| PollAnswer {
+        id,
+        text: format!("Answer {id}"),
+        votes,
+        mine,
+        ..Default::default()
+    };
+    let mut asked = message("e:$poll", true);
+    asked.poll = Some(Poll {
+        question: "Lunch?".into(),
+        answers: vec![answer(1, 2, false), answer(2, 0, false)],
+        can_end: true,
+        ..Default::default()
+    });
+    let mut closed = message("e:$closed", false);
+    closed.poll = Some(Poll {
+        answers: vec![answer(1, 1, false)],
+        finalized: true,
+        ..Default::default()
+    });
+    app.apply(Event::Timeline {
+        room: "dm".into(),
+        messages: timeline(vec![asked, closed]),
+    });
+    let vote = |app: &mut Application, item: &str, answers: Vec<u64>| {
+        app.dispatch(Action::Vote {
+            item: item.into(),
+            answers,
+        })
+    };
+
+    assert!(matches!(
+        vote(&mut app, "e:$poll", vec![2]).as_slice(),
+        [Effect::Backend(Command::Vote { item, answers, .. })] if item == "e:$poll" && answers == &[2]
+    ));
+    // Taking it back votes for none.
+    assert!(matches!(
+        vote(&mut app, "e:$poll", vec![]).as_slice(),
+        [Effect::Backend(Command::Vote { answers, .. })] if answers.is_empty()
+    ));
+    // One answer only, of those it has, while it's open.
+    assert!(vote(&mut app, "e:$poll", vec![1, 2]).is_empty());
+    assert!(vote(&mut app, "e:$poll", vec![9]).is_empty());
+    assert!(vote(&mut app, "e:$closed", vec![1]).is_empty());
+
+    // Closing it asks first, and only its author may.
+    app.dispatch(Action::AskEndPoll("e:$closed".into()));
+    assert!(app.state.confirm_end_poll.is_none());
+    app.dispatch(Action::AskEndPoll("e:$poll".into()));
+    assert_eq!(app.state.confirm_end_poll.as_deref(), Some("e:$poll"));
+    app.dispatch(Action::CancelEndPoll);
+    assert!(app.dispatch(Action::EndPoll).is_empty());
+    app.dispatch(Action::AskEndPoll("e:$poll".into()));
+    assert!(matches!(
+        app.dispatch(Action::EndPoll).as_slice(),
+        [Effect::Backend(Command::EndPoll { item, .. })] if item == "e:$poll"
+    ));
+    assert!(app.state.confirm_end_poll.is_none());
+
+    // Who voted shows by answer, the first unless one is asked for.
+    assert!(matches!(
+        app.dispatch(Action::ShowVoters {
+            item: "e:$poll".into(),
+            answer: None
+        })
+        .as_slice(),
+        [Effect::Backend(Command::Voters {
+            answer: 1,
+            after: None,
+            limit: 100,
+            ..
+        })]
+    ));
+    let ids: Vec<u64> = app
+        .state
+        .window_answers()
+        .iter()
+        .map(|answer| answer.id)
+        .collect();
+    assert_eq!(ids, [1, 2]);
+    assert!(app.state.window_reactions().is_empty());
+    app.apply(Event::Reactors {
+        room: "dm".into(),
+        item: "e:$poll".into(),
+        key: "1".into(),
+        after: None,
+        limit: 100,
+        result: Ok(vec![crate::chat::Reactor {
+            id: "a".into(),
+            me: true,
+            ..Default::default()
+        }]),
+    });
+    assert_eq!(app.state.reactions.as_ref().unwrap().people.len(), 1);
+    // Both counted votes haven't come, but the page came short.
+    assert!(!app.state.more_reactors());
+    // A vote isn't taken back from the window.
+    assert!(app.dispatch(Action::RemoveReactor("a".into())).is_empty());
+    assert!(matches!(
+        app.dispatch(Action::ShowReactors("2".into())).as_slice(),
+        [Effect::Backend(Command::Voters { answer: 2, .. })]
+    ));
 }
 
 #[cfg(feature = "discord")]
@@ -7176,4 +7512,142 @@ fn a_forum_shows_its_posts_as_discords_client_does() {
         Effect::Backend(Command::Discord(DiscordCommand::CloseThreads))
     )));
     assert!(app.state.forum.is_none());
+}
+
+#[test]
+#[cfg(feature = "discord")]
+fn a_forum_post_needs_a_title_a_message_and_a_tag_the_forum_requires() {
+    use yapfast_discord::{
+        ready::{self, permission},
+        service::{Snapshot, Status},
+    };
+    let backend = |effects: Vec<Effect>| -> Vec<Command> {
+        effects
+            .into_iter()
+            .filter_map(|effect| match effect {
+                Effect::Backend(command) => Some(command),
+                _ => None,
+            })
+            .collect()
+    };
+    let folder = tempfile::tempdir().unwrap();
+    let crash = folder.path().join("crash.png");
+    std::fs::File::create(&crash).unwrap().set_len(3).unwrap();
+    let server = ready::server(&serde_json::json!({
+        "id": "10", "owner_id": "99", "properties": {"name": "Test"},
+        "roles": [{"id": "10", "name": "@everyone", "position": 0, "permissions": (
+            permission::VIEW_CHANNEL | permission::SEND_MESSAGES
+                | permission::READ_MESSAGE_HISTORY).to_string()}],
+        "channels": [
+            {"id": "11", "type": 0, "name": "general", "position": 0},
+            {"id": "15", "type": 15, "name": "ideas", "position": 1, "flags": 16,
+             "available_tags": [
+                 {"id": "7", "name": "Bug", "emoji_id": null, "emoji_name": "🐛"},
+                 {"id": "8", "name": "Idea", "emoji_id": null, "emoji_name": "💡"},
+                 {"id": "9", "name": "Done", "moderated": true, "emoji_id": null, "emoji_name": "✅"},
+             ]},
+        ],
+    }))
+    .unwrap();
+    let mut app = Application::default();
+    app.apply(discord_event(Snapshot {
+        status: Status::Online,
+        user_id: Some("1".into()),
+        servers: vec![Arc::new(server)],
+        ..Default::default()
+    }));
+    app.dispatch(Action::Navigate(Navigation::Server("discord:10".into())));
+    let ideas = "discord:10:15".to_owned();
+    app.dispatch(Action::SelectRoom(ideas.clone()));
+    assert!(app.can_post(), "Send Messages is enough");
+    // A moderated tag is for those who manage threads.
+    let tags: Vec<_> = app
+        .post_tags(&ideas)
+        .into_iter()
+        .map(|tag| tag.id)
+        .collect();
+    assert_eq!(tags, ["7", "8"]);
+
+    app.dispatch(Action::NewPost);
+    let error = |app: &Application| app.state.new_post().and_then(|post| post.error.clone());
+    assert!(backend(app.dispatch(Action::CreatePost)).is_empty());
+    assert_eq!(error(&app).as_deref(), Some("A title is required"));
+
+    // A title is one line of at most 100 characters.
+    app.dispatch(Action::WriteNewPost {
+        title: Some(format!("Crash\n{}", "x".repeat(120))),
+        body: None,
+    });
+    let title = app.state.new_post().unwrap().title.clone();
+    assert!(title.starts_with("Crash x") && title.chars().count() == POST_TITLE_LIMIT);
+    app.dispatch(Action::WriteNewPost {
+        title: Some("Crash when pasting".into()),
+        body: None,
+    });
+    assert!(backend(app.dispatch(Action::CreatePost)).is_empty());
+    assert_eq!(error(&app).as_deref(), Some("A message is required"));
+
+    // A file is a message too, and the forum requires a tag.
+    app.dispatch(Action::Stage(vec![crash.clone()]));
+    assert!(backend(app.dispatch(Action::CreatePost)).is_empty());
+    assert_eq!(
+        error(&app).as_deref(),
+        Some("A tag is required to create a post in this channel")
+    );
+    for tag in ["9", "8", "7", "8"] {
+        app.dispatch(Action::TogglePostTag(tag.into()));
+    }
+    assert_eq!(app.state.new_post().unwrap().tags, ["7"]);
+    app.dispatch(Action::WriteNewPost {
+        title: None,
+        body: Some("It closes.\n".into()),
+    });
+    let posted = backend(app.dispatch(Action::CreatePost));
+    assert!(matches!(
+        posted.as_slice(),
+        [Command::Discord(DiscordCommand::PostInForum { room, title, tags, body, files })]
+            if *room == ideas && title == "Crash when pasting" && tags == &["7"]
+                && body == "It closes." && files.len() == 1 && files[0].path == crash
+    ));
+    // Nothing changes while it's on its way, and a refusal says why.
+    app.dispatch(Action::TogglePostTag("8".into()));
+    assert_eq!(app.state.new_post().unwrap().tags, ["7"]);
+    app.apply(Event::ForumPosted {
+        room: ideas.clone(),
+        result: Err("Couldn't create the post: Missing Access".into()),
+    });
+    assert!(!app.state.new_post().unwrap().posting);
+    assert!(error(&app).is_some_and(|error| error.contains("Missing Access")));
+
+    // Once made, the form and its files go.
+    assert_eq!(backend(app.dispatch(Action::CreatePost)).len(), 1);
+    app.apply(Event::ForumPosted {
+        room: ideas.clone(),
+        result: Ok("discord:10:70".into()),
+    });
+    assert!(app.state.new_post.is_none());
+    assert!(app.state.staged().is_empty());
+
+    // What was written stays while another room shows, and closing asks
+    // first.
+    app.dispatch(Action::NewPost);
+    app.dispatch(Action::WriteNewPost {
+        title: Some("Later".into()),
+        body: None,
+    });
+    app.dispatch(Action::SelectRoom("discord:10:11".into()));
+    assert!(app.state.new_post().is_none());
+    app.dispatch(Action::SelectRoom(ideas.clone()));
+    assert_eq!(app.state.new_post().unwrap().title, "Later");
+    app.dispatch(Action::CloseNewPost);
+    assert!(app.state.new_post().unwrap().leaving);
+    app.dispatch(Action::StayInNewPost);
+    assert!(!app.state.new_post().unwrap().leaving);
+    app.dispatch(Action::LeaveNewPost);
+    assert!(app.state.new_post.is_none());
+
+    // Files dropped on the forum open the form.
+    app.dispatch(Action::Stage(vec![crash]));
+    assert!(app.state.new_post().is_some());
+    assert_eq!(app.state.staged().len(), 1);
 }

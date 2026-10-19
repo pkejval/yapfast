@@ -31,6 +31,50 @@ pub struct Sending<'a> {
     pub silent: bool,
 }
 
+/// A poll to post, as Discord's "Create a Poll" dialog makes it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NewPoll {
+    pub question: String,
+    pub answers: Vec<NewAnswer>,
+    /// How long it takes votes, in hours: up to 32 days'.
+    pub hours: u32,
+    pub multiselect: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NewAnswer {
+    pub text: String,
+    /// The emoji itself, or a custom one's `name:id`, as a reaction takes it.
+    pub emoji: Option<String>,
+}
+
+impl NewPoll {
+    /// The poll as a message's `poll` field takes it. A custom emoji goes
+    /// by its id alone, as Discord's client sends it.
+    fn body(&self) -> Value {
+        let answers: Vec<Value> = self
+            .answers
+            .iter()
+            .map(|answer| {
+                let mut media = json!({"text": answer.text});
+                match answer.emoji.as_deref().map(|emoji| emoji.split_once(':')) {
+                    Some(Some((_, id))) => media["emoji"] = json!({"id": id, "name": ""}),
+                    Some(None) => media["emoji"] = json!({"name": answer.emoji}),
+                    None => {}
+                }
+                json!({"poll_media": media})
+            })
+            .collect();
+        json!({
+            "question": {"text": self.question},
+            "answers": answers,
+            "allow_multiselect": self.multiselect,
+            "duration": self.hours,
+            "layout_type": 1,
+        })
+    }
+}
+
 /// The message flag of `@silent`: no push or desktop notifications.
 const SUPPRESS_NOTIFICATIONS: u64 = 1 << 12;
 /// The type of a message reference that forwards the message, rather than
@@ -343,17 +387,7 @@ impl Api {
             body["flags"] = SUPPRESS_NOTIFICATIONS.into();
         }
         if !uploads.is_empty() {
-            body["attachments"] = uploads
-                .iter()
-                .enumerate()
-                .map(|(index, upload)| {
-                    json!({
-                        "id": index.to_string(),
-                        "filename": upload.filename,
-                        "uploaded_filename": upload.uploaded_filename,
-                    })
-                })
-                .collect();
+            body["attachments"] = attachments(uploads);
         }
         if let Some(reply) = options.reply {
             body["message_reference"] = json!({
@@ -371,6 +405,15 @@ impl Api {
                 });
             }
         }
+        let path = format!("/channels/{channel}/messages");
+        self.json(with_json(self.request(Method::POST, &path), &body))
+            .await
+    }
+
+    /// Posts a poll, a message with nothing else.
+    pub async fn send_poll(&self, channel: &str, poll: &NewPoll, nonce: &str) -> Result<Value> {
+        let mut body = message_body("", nonce);
+        body["poll"] = poll.body();
         let path = format!("/channels/{channel}/messages");
         self.json(with_json(self.request(Method::POST, &path), &body))
             .await
@@ -436,6 +479,17 @@ impl Api {
         if let Some(guild) = guild {
             path.push_str(&format!("&guild_id={guild}"));
         }
+        self.json(self.request(Method::GET, &path)).await
+    }
+
+    /// Applications' public objects, with their names and icons, as the
+    /// client fetches them for activities: `[{id, name, icon, ...}]`.
+    pub async fn public_applications(&self, ids: &[&str]) -> Result<Value> {
+        let query: Vec<_> = ids
+            .iter()
+            .map(|id| format!("application_ids={id}"))
+            .collect();
+        let path = format!("/applications/public?{}", query.join("&"));
         self.json(self.request(Method::GET, &path)).await
     }
 
@@ -618,6 +672,46 @@ impl Api {
         }
     }
 
+    /// Votes for `answers` of a message's poll in place of this account's
+    /// earlier vote; none takes the vote back.
+    pub async fn vote(&self, channel: &str, message: &str, answers: &[u64]) -> Result<()> {
+        let path = format!("/channels/{channel}/polls/{message}/answers/@me");
+        let body = json!({"answer_ids": answers});
+        self.empty(with_json(self.request(Method::PUT, &path), &body))
+            .await
+    }
+
+    /// Closes this account's poll now. Discord sends the message again,
+    /// closed, as a MESSAGE_UPDATE.
+    pub async fn end_poll(&self, channel: &str, message: &str) -> Result<()> {
+        let path = format!("/channels/{channel}/polls/{message}/expire");
+        self.empty(self.request(Method::POST, &path)).await
+    }
+
+    /// Who voted for `answer` of a message's poll, as user objects: up to
+    /// `limit`, at most 100, by user id, after the user `after`.
+    pub async fn voters(
+        &self,
+        channel: &str,
+        message: &str,
+        answer: u64,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Value>> {
+        let mut path =
+            format!("/channels/{channel}/polls/{message}/answers/{answer}?limit={limit}");
+        if let Some(after) = after {
+            path.push_str(&format!("&after={after}"));
+        }
+        match self.json(self.request(Method::GET, &path)).await? {
+            Value::Object(mut answer) => match answer.remove("users") {
+                Some(Value::Array(users)) => Ok(users),
+                _ => bail!("could not understand Discord's answer"),
+            },
+            _ => bail!("could not understand Discord's answer"),
+        }
+    }
+
     /// Opens the DM with `user`, or finds the one already open; returns its channel id.
     pub async fn open_dm(&self, user: &str) -> Result<String> {
         let body = json!({"recipients": [user]});
@@ -739,6 +833,27 @@ impl Api {
         };
         self.json(with_json(self.request(Method::POST, &path), body))
             .await
+    }
+
+    /// Posts in a forum, as Discord's client does: a thread named `title`,
+    /// archiving after `archive_after` minutes of quiet, with the forum's
+    /// tags by id and a first message of `content` and uploaded files. The
+    /// post's channel object; Discord sends THREAD_CREATE and the message.
+    pub async fn create_post(
+        &self,
+        forum: &str,
+        title: &str,
+        archive_after: u16,
+        tags: &[String],
+        content: &str,
+        uploads: &[Upload],
+    ) -> Result<Value> {
+        let path = format!("/channels/{forum}/threads?use_nested_fields=true");
+        self.json(with_json(
+            self.request(Method::POST, &path),
+            &post_body(title, archive_after, tags, content, uploads),
+        ))
+        .await
     }
 
     /// The first and newest messages of a forum's posts, and who started
@@ -1184,7 +1299,11 @@ impl Api {
         let test_file = client::test_server()
             .and_then(|server| url.strip_prefix(server))
             .is_some_and(|path| path.starts_with('/'));
-        if !discord_file(url) && !test_file && !crate::gifs::provider_media(url) {
+        if !discord_file(url)
+            && !test_file
+            && !crate::gifs::provider_media(url)
+            && !crate::activity::outside_picture(url)
+        {
             bail!("not a Discord file");
         }
         let _turn = self.downloads.acquire().await?;
@@ -1219,7 +1338,11 @@ impl Api {
         let test_file = client::test_server()
             .and_then(|server| url.strip_prefix(server))
             .is_some_and(|path| path.starts_with('/'));
-        if !discord_file(url) && !test_file && !crate::gifs::provider_media(url) {
+        if !discord_file(url)
+            && !test_file
+            && !crate::gifs::provider_media(url)
+            && !crate::activity::outside_picture(url)
+        {
             bail!("not a Discord file");
         }
         let mut response = self
@@ -1404,6 +1527,42 @@ fn message_body(content: &str, nonce: &str) -> Value {
     })
 }
 
+/// Uploaded files as a message's `attachments` name them.
+fn attachments(uploads: &[Upload]) -> Value {
+    uploads
+        .iter()
+        .enumerate()
+        .map(|(index, upload)| {
+            json!({
+                "id": index.to_string(),
+                "filename": upload.filename,
+                "uploaded_filename": upload.uploaded_filename,
+            })
+        })
+        .collect()
+}
+
+/// A forum post as Discord's client asks for one: the thread, and its
+/// first message nested in it, which carries no nonce.
+fn post_body(
+    title: &str,
+    archive_after: u16,
+    tags: &[String],
+    content: &str,
+    uploads: &[Upload],
+) -> Value {
+    let mut message = json!({ "content": content });
+    if !uploads.is_empty() {
+        message["attachments"] = attachments(uploads);
+    }
+    json!({
+        "name": title,
+        "auto_archive_duration": archive_after,
+        "applied_tags": tags,
+        "message": message,
+    })
+}
+
 fn with_json(request: RequestBuilder, body: &Value) -> RequestBuilder {
     request
         .header(header::CONTENT_TYPE, "application/json")
@@ -1462,6 +1621,61 @@ fn discord_file(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_poll_goes_as_discords_client_sends_it() {
+        use super::{NewAnswer, NewPoll};
+        let answer = |text: &str, emoji: Option<&str>| NewAnswer {
+            text: text.into(),
+            emoji: emoji.map(Into::into),
+        };
+        let poll = NewPoll {
+            question: "Lunch?".into(),
+            answers: vec![
+                answer("Pizza", Some("🍕")),
+                answer("Soup", Some("talk:77")),
+                answer("Salad", None),
+            ],
+            hours: 24,
+            multiselect: true,
+        };
+        assert_eq!(
+            poll.body(),
+            serde_json::json!({
+                "question": {"text": "Lunch?"},
+                "answers": [
+                    {"poll_media": {"text": "Pizza", "emoji": {"name": "🍕"}}},
+                    {"poll_media": {"text": "Soup", "emoji": {"id": "77", "name": ""}}},
+                    {"poll_media": {"text": "Salad"}},
+                ],
+                "allow_multiselect": true,
+                "duration": 24,
+                "layout_type": 1,
+            })
+        );
+    }
+
+    #[test]
+    fn a_forum_post_nests_its_first_message() {
+        let upload = super::Upload {
+            filename: "crash.png".into(),
+            uploaded_filename: "uploads/1/crash.png".into(),
+        };
+        assert_eq!(
+            super::post_body("Crash", 4320, &["7".into()], "It closes.", &[upload]),
+            serde_json::json!({
+                "name": "Crash",
+                "auto_archive_duration": 4320,
+                "applied_tags": ["7"],
+                "message": {
+                    "content": "It closes.",
+                    "attachments": [
+                        { "id": "0", "filename": "crash.png", "uploaded_filename": "uploads/1/crash.png" },
+                    ],
+                },
+            })
+        );
+    }
+
     #[test]
     fn downloads_that_may_work_later() {
         use super::{Refused, StatusCode, may_work_later};

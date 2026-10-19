@@ -59,7 +59,7 @@ pub(super) async fn run(
         snapshots.send_modify(|snapshot| Arc::make_mut(snapshot).status = Status::Connecting);
         let connect = async {
             shared.api.learn_build_number().await;
-            crate::activity::merge(&mut shared.presence, shared.activity.borrow().as_deref());
+            crate::game_activity::merge(&mut shared.presence, shared.activity.borrow().as_deref());
             Gateway::connect(&token, shared.presence.clone(), &mut reconnects).await
         };
         let connected = tokio::select! {
@@ -615,7 +615,7 @@ impl Session<'_> {
             .as_mut()
             .reset(Instant::now() + until(next));
         let mut presence = self.tracker.own_presence(away);
-        crate::activity::merge(
+        crate::game_activity::merge(
             &mut presence,
             self.shared.activity.borrow_and_update().as_deref(),
         );

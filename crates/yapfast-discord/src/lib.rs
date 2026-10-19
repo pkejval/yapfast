@@ -1,8 +1,9 @@
 //! Yapfast's Discord connection: account login, the gateway, messages and voice.
 //! See docs/discord.md. Everything Discord-specific stays in this crate.
 
-mod activity;
+pub mod activity;
 pub mod api;
+mod game_activity;
 pub mod cache;
 mod call_connection;
 pub mod call_stats;
@@ -15,7 +16,6 @@ pub mod embed;
 pub mod event;
 pub mod forum;
 pub mod frecency;
-pub mod game_detection;
 pub mod gateway;
 pub mod gifs;
 pub mod limits;
@@ -26,8 +26,6 @@ pub mod opus;
 pub mod profile;
 pub mod ready;
 pub mod remote_auth;
-#[cfg(target_os = "linux")]
-mod rpc;
 pub mod rtp;
 pub mod search;
 pub mod service;
@@ -42,5 +40,5 @@ mod voice_connection;
 /// The activity currently shared by this account and its start time in Unix
 /// milliseconds, when the activity provides one.
 pub fn current_game_activity() -> Option<(String, Option<u64>)> {
-    activity::current()
+    game_activity::current()
 }

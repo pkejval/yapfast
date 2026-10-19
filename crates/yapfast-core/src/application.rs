@@ -26,7 +26,9 @@ mod gifs;
 mod header;
 mod members;
 mod messages;
+mod new_post;
 mod places;
+mod polls;
 mod preview;
 mod profiles;
 mod reactions;
@@ -41,9 +43,13 @@ pub use gifs::{GifPicker, GifPicture, GifView};
 pub use members::{BAN_HISTORY, RoleChoice, TIMEOUT_TIMES};
 #[cfg(all(feature = "discord", any(test, feature = "test-fixtures")))]
 pub use members::{member_server, with_clubs};
+pub use new_post::{NewPost, POST_TAGS, POST_TITLE_LIMIT};
 pub use places::{
     ChannelAsk, ChannelDialog, INVITE_AGES, INVITE_USES, InviteDialog, LeaveDialog, ListedCategory,
     SLOWMODES,
+};
+pub use polls::{
+    ANSWER_LIMIT, DraftAnswer, POLL_ANSWERS, POLL_HOURS, PollDraft, PollEdit, QUESTION_LIMIT,
 };
 pub use reactions::{ReactionTip, ReactionsWindow, TIP_PEOPLE};
 pub use rooms::{MUTE_TIMES, MenuChoice, network_id, network_link};
@@ -447,6 +453,8 @@ pub struct AppState {
     pub category_changes: u64,
     pub navigation: Navigation,
     pub selected: Option<String>,
+    /// The selected voice channel shows its chat in place of its call.
+    pub voice_chat: bool,
     /// A Discord thread shown beside the selected channel.
     pub aside: Option<aside::Aside>,
     pub room_ready: bool,
@@ -489,6 +497,10 @@ pub struct AppState {
     pub sending: Option<String>,
     /// The selected room's message the user is asked to confirm deleting.
     pub confirm_delete: Option<String>,
+    /// The message whose poll the user is asked to confirm closing now.
+    pub confirm_end_poll: Option<String>,
+    /// The poll being made, while its dialog is open.
+    pub poll_draft: Option<PollDraft>,
     /// A message being forwarded, while its dialog is open.
     pub forwarding: Option<Forwarding>,
     pub places_used: PlacesUsed,
@@ -503,6 +515,8 @@ pub struct AppState {
     pub forum: Option<ForumView>,
     /// The "New Thread" form beside the open Discord channel.
     pub new_thread: Option<NewThread>,
+    /// The form for a post in a Discord forum, kept while other rooms show.
+    pub new_post: Option<NewPost>,
     /// The reaction the pointer stayed over, by item and key, who the
     /// latest reactions hovered were, and the Reactions window.
     pub hovered_reaction: Option<(String, String)>,
@@ -582,6 +596,7 @@ impl AppState {
     pub fn can_write(&self) -> bool {
         !self.busy
             && self.room_ready
+            && self.shows_text()
             && self.selected_room().is_some_and(|room| self.writable(room))
     }
 
@@ -589,7 +604,7 @@ impl AppState {
     /// room from a verified device, or a Discord channel that allows it while
     /// Discord is connected.
     pub fn writable(&self, room: &ChatRoom) -> bool {
-        if room.voice {
+        if !room.has_text() {
             false
         } else if room.network == Network::Discord {
             self.discord_online && !room.locked && !room.read_only
@@ -708,6 +723,7 @@ impl AppState {
                 presence: None,
                 color: message.color,
                 activity: None,
+                activities: Default::default(),
                 roles: Default::default(),
                 timed_out_until: None,
             });
@@ -731,6 +747,7 @@ impl AppState {
                 presence: None,
                 color: None,
                 activity: None,
+                activities: Default::default(),
                 roles: Default::default(),
                 timed_out_until: None,
             });
@@ -754,6 +771,7 @@ impl AppState {
             presence: None,
             color: None,
             activity: None,
+            activities: Default::default(),
             roles: Default::default(),
             timed_out_until: None,
         })
@@ -949,15 +967,23 @@ impl AppState {
         self.search.as_ref().filter(|search| search.place == place)
     }
 
-    /// The selected conversation, when it's a DM, group DM or text channel
-    /// this account may read, whose network lets it do what `can` asks, and
-    /// not a message request.
+    /// The selected conversation, when it shows messages this account may
+    /// read, its network lets it do what `can` asks, and it isn't a message
+    /// request.
     pub fn conversation_that(
         &self,
         can: impl Fn(&crate::network::Capabilities) -> bool,
     ) -> Option<&ChatRoom> {
+        self.selected_room().filter(|room| {
+            self.shows_text() && !room.locked && !room.request && can(&room.capabilities)
+        })
+    }
+
+    /// The selected room shows messages: it isn't a voice room, or it's a
+    /// voice channel showing its chat.
+    pub fn shows_text(&self) -> bool {
         self.selected_room()
-            .filter(|room| !room.voice && !room.locked && !room.request && can(&room.capabilities))
+            .is_some_and(|room| !room.voice || self.voice_chat)
     }
 
     /// Who is in the selected DM besides this account, as far as Yapfast knows:
@@ -1010,6 +1036,7 @@ impl AppState {
                     && (room.voice
                         || (room.direct && room.capabilities.dm_calls && !room.request))
                     && !room.locked
+                    && !room.join_locked
                     && if room.network == Network::Discord {
                         self.discord_online && !self.busy
                     } else {
@@ -1038,8 +1065,13 @@ pub enum Action {
     /// Mark a listed conversation read, or every conversation of a listed
     /// server, as their menus do.
     MarkRead(String),
-    /// Go to wherever a conversation is listed and open it, as a notification does.
+    /// Go to wherever a conversation is listed and open it.
     Open(String),
+    /// [`Action::Open`], showing the conversation's messages: a voice
+    /// channel's chat rather than its call, as a notification from it does.
+    OpenChat(String),
+    /// Show the selected voice channel's chat, or with `false` its call.
+    ShowVoiceChat(bool),
     /// Show a Discord thread beside the open channel, as its link in a
     /// message does; anything else opens as [`Action::Open`] does.
     OpenAside(String),
@@ -1072,6 +1104,28 @@ pub enum Action {
         key: String,
     },
     RequestDelete(String),
+    /// Vote for these answers of a Discord message's poll, by item, in
+    /// place of this account's vote; none takes it back.
+    Vote {
+        item: String,
+        answers: Vec<u64>,
+    },
+    /// Open the "Create a Poll" dialog for the open Discord conversation.
+    OpenPollDraft,
+    EditPoll(PollEdit),
+    PostPoll,
+    ClosePollDraft,
+    /// Ask to make sure before closing this account's poll, by item.
+    AskEndPoll(String),
+    CancelEndPoll,
+    /// Close the poll asked about now.
+    EndPoll,
+    /// Open the Reactions window on who voted in a message's poll, by
+    /// item: for one answer, or the first.
+    ShowVoters {
+        item: String,
+        answer: Option<u64>,
+    },
     /// Pin a message of the selected room to its pinned messages, or
     /// unpin it if it's there.
     PinMessage(String),
@@ -1251,6 +1305,22 @@ pub enum Action {
     SearchPosts(String),
     /// The forum's list of posts scrolled near its end: load more of them.
     MorePosts,
+    /// Open the form for a post in the forum on screen.
+    NewPost,
+    /// Write the form's title or message.
+    WriteNewPost {
+        title: Option<String>,
+        body: Option<String>,
+    },
+    /// Give the post a tag, by id, or take it away.
+    TogglePostTag(String),
+    /// Make the post the form describes.
+    CreatePost,
+    /// Close the form, asking first if something was written; close it
+    /// anyway; or go back to it.
+    CloseNewPost,
+    LeaveNewPost,
+    StayInNewPost,
     /// Open the "New Thread" form beside the open channel: from a message,
     /// by item, or from none.
     NewThread {
@@ -1928,7 +1998,9 @@ impl Application {
                 self.state.profile_panel = shown;
                 self.show_panel_profile()
             }
-            Action::Open(id) => self.open(id),
+            Action::Open(id) => self.open(id, false),
+            Action::OpenChat(id) => self.open(id, true),
+            Action::ShowVoiceChat(chat) => self.show_voice_chat(chat),
             Action::OpenAside(id) => self.open_aside(id),
             Action::CloseAside => self.close_aside(),
             Action::ExpandAside => self.expand_aside(),
@@ -1974,6 +2046,21 @@ impl Application {
             }
             Action::React { item, key } => self.react(item, key),
             Action::RequestDelete(item) => self.request_delete(item),
+            Action::Vote { item, answers } => self.vote(item, answers),
+            Action::OpenPollDraft => self.open_poll_draft(),
+            Action::EditPoll(edit) => self.edit_poll(edit),
+            Action::PostPoll => self.post_poll(),
+            Action::ClosePollDraft => {
+                self.state.poll_draft = None;
+                vec![]
+            }
+            Action::AskEndPoll(item) => self.ask_end_poll(item),
+            Action::CancelEndPoll => {
+                self.state.confirm_end_poll = None;
+                vec![]
+            }
+            Action::EndPoll => self.end_poll(),
+            Action::ShowVoters { item, answer } => self.show_voters(item, answer),
             Action::PinMessage(item) => self.pin_message(item),
             Action::StartForward(item) => self.start_forward(item),
             Action::ChooseForward(target) => self.choose_forward(target),
@@ -2114,6 +2201,33 @@ impl Application {
             Action::MoreThreads => self.more_threads(),
             Action::SearchPosts(query) => self.search_posts(query),
             Action::MorePosts => self.more_posts(),
+            Action::NewPost => {
+                self.open_new_post();
+                vec![]
+            }
+            Action::WriteNewPost { title, body } => {
+                self.write_new_post(title, body);
+                vec![]
+            }
+            Action::TogglePostTag(tag) => {
+                self.toggle_post_tag(tag);
+                vec![]
+            }
+            Action::CreatePost => self.create_post(),
+            Action::CloseNewPost => {
+                self.close_new_post(false);
+                vec![]
+            }
+            Action::LeaveNewPost => {
+                self.close_new_post(true);
+                vec![]
+            }
+            Action::StayInNewPost => {
+                if let Some(post) = &mut self.state.new_post {
+                    post.leaving = false;
+                }
+                vec![]
+            }
             Action::NewThread { message, from } => self.open_new_thread(message, from),
             Action::WriteNewThread { name, body } => {
                 self.write_new_thread(name, body);
@@ -2589,6 +2703,7 @@ impl Application {
             } => return self.threads_came(room, query, offset, result, starters),
             Event::Posts { room, result } => return self.posts_came(room, result),
             Event::ThreadStarted { room, result } => return self.thread_started(room, result),
+            Event::ForumPosted { room, result } => return self.forum_posted(room, result),
             Event::Found {
                 place,
                 query,
@@ -2758,6 +2873,7 @@ impl Application {
                 }
             }
             Event::Forwarded { room, result } => self.forwarded(room, result),
+            Event::PollPosted { room, result } => self.poll_posted(room, result),
             Event::Draft { room, body } => {
                 // Text typed since opening the room wins over the saved draft.
                 if self.state.drafts.get(&room).is_none_or(String::is_empty)
@@ -2893,8 +3009,7 @@ impl Application {
         let Some(room) = self.state.selected.clone() else {
             return;
         };
-        let text = self.state.selected_room().is_some_and(|room| !room.voice);
-        if !text
+        if !self.state.shows_text()
             || !self.state.room_ready
             || self.state.preview
             || Network::of(&room) != Network::Discord
