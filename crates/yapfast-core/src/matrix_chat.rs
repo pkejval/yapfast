@@ -602,6 +602,11 @@ impl Matrix {
             }
             // Yapfast removes others' Matrix reactions only as Discord's.
             Command::RemoveReactor { .. } => {}
+            // Yapfast shows only Discord's polls.
+            Command::Vote { .. }
+            | Command::SendPoll { .. }
+            | Command::EndPoll { .. }
+            | Command::Voters { .. } => {}
             // Yapfast pins only Discord's messages.
             Command::Pin { .. } => {}
             // Matrix's attachments have no address, which copying asks for.
@@ -1086,6 +1091,7 @@ fn load_members(open: &mut OpenRoom, events: &UnboundedSender<Event>) {
                         presence: None,
                         color: None,
                         activity: None,
+                        activities: Default::default(),
                         roles: Default::default(),
                         timed_out_until: None,
                     })
@@ -1182,6 +1188,7 @@ async fn room_index(client: &Client) -> RoomIndex {
             read_only: false,
             slowed: false,
             category: String::new(),
+            category_id: None,
             request: false,
             person,
             people: vec![],
@@ -1191,8 +1198,10 @@ async fn room_index(client: &Client) -> RoomIndex {
             upload_limit: MAX_ATTACHMENT_BYTES,
             presence: None,
             activity: None,
+            activities: Default::default(),
             parent: None,
             forum: false,
+            preview: None,
         });
     }
     result.sort_by(|a, b| {

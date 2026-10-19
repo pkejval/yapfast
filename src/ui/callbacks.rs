@@ -79,6 +79,7 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
         }
     });
     super::gifs::bind(window, adapter);
+    super::polls::bind(window, adapter);
     super::call_link::bind(window, adapter);
     // UI bindings can request images while refresh borrows the adapter.
     // Deliver their requests in one batch after the current UI work.
@@ -632,6 +633,11 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
     bind!(on_close_new_thread, Action::CloseNewThread);
     bind!(on_leave_new_thread, Action::LeaveNewThread);
     bind!(on_stay_in_new_thread, Action::StayInNewThread);
+    bind!(on_new_post, Action::NewPost);
+    bind!(on_create_post, Action::CreatePost);
+    bind!(on_close_post, Action::CloseNewPost);
+    bind!(on_leave_post, Action::LeaveNewPost);
+    bind!(on_stay_post, Action::StayInNewPost);
     {
         let adapter = adapter.clone();
         let weak = window.as_weak();
@@ -696,6 +702,44 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
                         body: Some(body.into()),
                     },
                 );
+            }
+        });
+    }
+    {
+        let (adapter, weak) = (adapter.clone(), window.as_weak());
+        window.on_post_title_edited(move |title| {
+            if let Some(window) = weak.upgrade() {
+                adapter.borrow_mut().action(
+                    &window,
+                    Action::WriteNewPost {
+                        title: Some(title.into()),
+                        body: None,
+                    },
+                );
+            }
+        });
+    }
+    {
+        let (adapter, weak) = (adapter.clone(), window.as_weak());
+        window.on_post_body_edited(move |body| {
+            if let Some(window) = weak.upgrade() {
+                adapter.borrow_mut().action(
+                    &window,
+                    Action::WriteNewPost {
+                        title: None,
+                        body: Some(body.into()),
+                    },
+                );
+            }
+        });
+    }
+    {
+        let (adapter, weak) = (adapter.clone(), window.as_weak());
+        window.on_toggle_post_tag(move |tag| {
+            if let Some(window) = weak.upgrade() {
+                adapter
+                    .borrow_mut()
+                    .action(&window, Action::TogglePostTag(tag.into()));
             }
         });
     }
@@ -934,9 +978,28 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
             adapter.refresh(&window);
             return;
         }
+        // A pin's notice jumps to the message pinned, or shows the pinned
+        // messages.
+        if let Some(item) = link.strip_prefix(messages::JUMP_LINK) {
+            if let Some(window) = weak.upgrade() {
+                state
+                    .borrow_mut()
+                    .action(&window, Action::Jump(item.to_owned()));
+            }
+            return;
+        }
+        if link == messages::PINS_LINK {
+            if let Some(window) = weak.upgrade() {
+                window.invoke_open_pins();
+            }
+            return;
+        }
         // A mention opens the person's card, or the role's members, beside the
         // mention, or by the pointer when the link's place isn't known.
-        if let Some(target) = mention::target(&link) {
+        let author = link
+            .strip_prefix(messages::AUTHOR_LINK)
+            .map(|user| mention::Target::User(user.to_owned()));
+        if let Some(target) = author.or_else(|| mention::target(&link)) {
             let Some(window) = weak.upgrade() else { return };
             if let Some(rect) = i_slint_core::yapfast_selection::clicked_link() {
                 window.invoke_anchor_link(
@@ -1041,6 +1104,12 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
     window.on_delete_theme(move || {
         if let Some(window) = weak.upgrade() {
             state.borrow_mut().delete_theme(&window);
+        }
+    });
+    let weak = window.as_weak();
+    window.on_record_talk_key(move |on| {
+        if let Some(window) = weak.upgrade() {
+            window.set_talk_recording(on);
         }
     });
     let state = adapter.clone();
@@ -1162,6 +1231,10 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
         yapfast_core::noise::set_dereverb(layout.reduce_room_echo);
         layout.input_sensitivity = Some(window.get_sensitivity());
         yapfast_core::noise::set_sensitivity(layout.sensitivity() as f32);
+        layout.input_mode = chosen(&INPUT_MODES, window.get_input_mode());
+        yapfast_core::push_to_talk::set_on(layout.input_mode == InputMode::PushToTalk);
+        layout.push_to_talk_release_delay = Some(window.get_talk_delay().max(0) as u32);
+        yapfast_core::push_to_talk::set_release_delay(layout.release_delay());
         layout.share_typing = Some(window.get_share_typing());
         layout.notifications = Some(window.get_notifications());
         layout.notification_text = Some(window.get_notification_text());
@@ -1173,6 +1246,7 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
         layout.close_to_tray = Some(window.get_close_to_tray());
         adapter.layout.write(&adapter.root);
         adapter.show_tray();
+        adapter.watch_talk_key(&window);
         let start = window.get_start_on_sign_in();
         if AUTOSTART.get() && start != autostart::enabled() {
             match autostart::set(start) {
@@ -1474,6 +1548,24 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
     });
     let state = adapter.clone();
     let weak = window.as_weak();
+    window.on_open_chat(move |id| {
+        if let Some(window) = weak.upgrade() {
+            state
+                .borrow_mut()
+                .action(&window, Action::OpenChat(id.into()));
+        }
+    });
+    let state = adapter.clone();
+    let weak = window.as_weak();
+    window.on_show_voice_chat(move |chat| {
+        if let Some(window) = weak.upgrade() {
+            state
+                .borrow_mut()
+                .action(&window, Action::ShowVoiceChat(chat));
+        }
+    });
+    let state = adapter.clone();
+    let weak = window.as_weak();
     window.on_select_room(move |id| {
         if let Some(window) = weak.upgrade() {
             state
@@ -1664,15 +1756,15 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
     });
     let state = adapter.clone();
     let weak = window.as_weak();
-    window.on_toggle_category(move |heading| {
+    window.on_toggle_category(move |category| {
         let Some(window) = weak.upgrade() else { return };
         let mut adapter = state.borrow_mut();
         let Navigation::Server(server) = adapter.app.state.navigation.clone() else {
             return;
         };
         let collapsed = adapter.layout.collapsed.entry(server.clone()).or_default();
-        if !collapsed.remove(heading.as_str()) {
-            collapsed.insert(heading.into());
+        if !collapsed.remove(category.as_str()) {
+            collapsed.insert(category.into());
         }
         if collapsed.is_empty() {
             adapter.layout.collapsed.remove(&server);

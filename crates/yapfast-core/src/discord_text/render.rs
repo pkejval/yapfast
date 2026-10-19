@@ -38,6 +38,9 @@ pub(super) fn notification(
             "Sent a picture".into()
         } else if !message.attachments.is_empty() {
             "Sent a file".into()
+        } else if let Some(poll) = &message.poll {
+            // As Discord's client says it.
+            format!("[poll] {}", poll.question)
         } else if let Some(title) = message.embeds.iter().find_map(|embed| embed.title.clone()) {
             title
         } else {
@@ -83,7 +86,7 @@ pub(super) fn found(
         color: server.and_then(|server| discord.color(server, &message.author_id)),
         bot: message.bot,
         body: match &message.system {
-            Some(system) => format!("{author} {system}"),
+            Some(system) => system_body(&author, system),
             None => discord.render(server, &message.content),
         },
         author,
@@ -116,7 +119,60 @@ pub(super) fn found(
             .collect(),
         mentions: mentions(discord, server, &message.content),
         emoji: custom_emoji(message),
+        // Shown, not voted in: its author can't end it from here either.
+        poll: message.poll.as_ref().map(|poll| chat_poll(poll, false)),
+        notice: chat_notice(message),
         ..Default::default()
+    }
+}
+
+/// A Discord message's notice, as the timeline marks it.
+pub(super) fn chat_notice(message: &Message) -> Option<crate::chat::Notice> {
+    use crate::chat::NoticeKind;
+    use yapfast_discord::message::Notice;
+    let kind = match message.notice.as_ref()? {
+        Notice::Pinned(id) => NoticeKind::Pinned(id.as_ref().map(|id| format!("d:{id}"))),
+        Notice::Joined => NoticeKind::Joined,
+        Notice::ThreadStarted => NoticeKind::ThreadStarted,
+        Notice::Call => NoticeKind::Call,
+        Notice::PollResult => NoticeKind::PollResult,
+    };
+    Some(crate::chat::Notice {
+        kind,
+        text: message.system.clone()?,
+    })
+}
+
+/// What a notice, such as a pin or a call, says: its author's name, then
+/// what they did. A closed poll's says "Ann's poll".
+pub(super) fn system_body(author: &str, system: &str) -> String {
+    if system.starts_with('\'') {
+        format!("{author}{system}")
+    } else {
+        format!("{author} {system}")
+    }
+}
+
+/// A Discord poll as a message shows it; `own` is this account's, which
+/// may end it.
+pub(super) fn chat_poll(poll: &yapfast_discord::message::Poll, own: bool) -> Poll {
+    Poll {
+        question: poll.question.clone(),
+        answers: poll
+            .answers
+            .iter()
+            .map(|answer| PollAnswer {
+                id: answer.id,
+                text: answer.text.clone(),
+                emoji: answer.emoji.as_ref().map(|(key, _)| key.clone()),
+                votes: answer.votes,
+                mine: answer.me,
+            })
+            .collect(),
+        expiry: poll.expiry.map(|expiry| expiry / 1000),
+        finalized: poll.finalized,
+        multiselect: poll.multiselect,
+        can_end: own && !poll.finalized,
     }
 }
 
@@ -227,12 +283,22 @@ pub(super) fn hits_in(discord: &Discord, guild: &str, messages: &[Message]) -> V
 /// The custom emoji in a message's text and reactions.
 pub(super) fn custom_emoji(message: &Message) -> Vec<CustomEmoji> {
     let mut found = emoji_in(&message.content);
-    for reaction in &message.reactions {
-        if let Some((_, id)) = reaction.emoji.split_once(':')
-            && !found.iter().any(|known| known.id == id)
-        {
+    let reactions = message.reactions.iter().filter_map(|reaction| {
+        let (_, id) = reaction.emoji.split_once(':')?;
+        Some((&reaction.key, id))
+    });
+    let answers = message
+        .poll
+        .iter()
+        .flat_map(|poll| &poll.answers)
+        .filter_map(|answer| {
+            let (key, id) = answer.emoji.as_ref()?;
+            Some((key, id.as_deref()?))
+        });
+    for (key, id) in reactions.chain(answers) {
+        if !found.iter().any(|known| known.id == id) {
             found.push(CustomEmoji {
-                text: reaction.key.clone(),
+                text: key.clone(),
                 id: id.to_owned(),
                 animated: false,
                 picture: yapfast_discord::ready::custom_emoji(
@@ -297,18 +363,37 @@ pub(super) fn send_topic(
     if !opened && channel.topic_sent.as_ref() == Some(&sent) {
         return;
     }
-    let topic = sent.0.as_deref().map(|raw| {
-        Arc::new(Topic {
-            body: discord.render(server, raw),
-            mentions: mentions(discord, server, raw),
-            emoji: emoji_in(raw),
-        })
-    });
+    let topic = sent.0.as_deref().map(|raw| topic(discord, server, raw));
     channel.topic_sent = Some(sent);
     let _ = events.send(Event::Topic {
         room: channel.room.clone(),
         topic,
     });
+}
+
+/// A channel's topic, from Discord's markup, as Yapfast shows it.
+fn topic(
+    discord: &Discord,
+    server: Option<&yapfast_discord::ready::Server>,
+    raw: &str,
+) -> Arc<Topic> {
+    Arc::new(Topic {
+        body: discord.render(server, raw),
+        mentions: mentions(discord, server, raw),
+        emoji: emoji_in(raw),
+    })
+}
+
+/// A forum's topic, its post guidelines, by server and channel id.
+pub(super) fn forum_topic(discord: &Discord, guild: &str, forum: &str) -> Option<Arc<Topic>> {
+    let snapshot = discord.snapshots().borrow().clone();
+    let server = snapshot
+        .servers
+        .iter()
+        .find(|server| server.id == guild)
+        .map(Arc::as_ref)?;
+    let raw = server.channel(forum)?.topic.clone()?;
+    Some(topic(discord, Some(server), &raw))
 }
 
 /// Who and what a message mentions, as its rendered body shows them.
@@ -351,11 +436,10 @@ pub(super) fn mention_groups(discord: &Discord, room: &str) -> Vec<MentionGroup>
     let Some(server) = snapshot.servers.iter().find(|server| server.id == guild) else {
         return vec![];
     };
+    // A voice channel's chat may mention everyone too.
     let everyone = server
-        .text_channels
-        .iter()
-        .find(|text| text.id == channel)
-        .is_some_and(|text| text.mention_everyone);
+        .channel(channel)
+        .is_some_and(|known| known.mention_everyone);
     let mut groups = Vec::new();
     if everyone {
         for name in ["everyone", "here"] {
@@ -443,6 +527,7 @@ pub(super) fn chat_profile(
         // What the member list knows; the profile doesn't say.
         presence: None,
         activity: None,
+        activities: Default::default(),
     }
 }
 
@@ -489,6 +574,7 @@ pub(super) fn chat_member(member: ListedMember) -> ChatMember {
         presence: Some(discord::presence(member.presence)),
         color: member.color,
         activity: member.activity,
+        activities: member.activities,
         roles: member.roles,
         timed_out_until: member.timed_out_until,
     }

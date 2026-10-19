@@ -25,6 +25,18 @@ pub const FOUND_PICTURES: usize = 4;
 pub const VIEW_WIDTH: u32 = 1920;
 pub const VIEW_HEIGHT: u32 = 1200;
 
+/// What someone is doing on Discord: a game, music, a stream or a Hang
+/// status, shared as the gateway parsed it.
+#[cfg(feature = "discord")]
+pub use yapfast_discord::activity::{Activities, Activity, Kind as ActivityKind};
+
+/// Only Discord says what people are doing.
+#[cfg(not(feature = "discord"))]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Activity {}
+#[cfg(not(feature = "discord"))]
+pub type Activities = Arc<[Activity]>;
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ChatRoom {
     pub id: String,
@@ -48,7 +60,8 @@ pub struct ChatRoom {
     /// Listed, but this account may not read it, such as a Discord channel
     /// its roles keep it out of.
     pub locked: bool,
-    /// Voice connection is forbidden, independently of reading its text chat.
+    /// A voice channel this account may not join, which Discord lists with
+    /// a lock; its chat may still be readable.
     pub join_locked: bool,
     /// Readable, but this account may not send here, such as a Discord
     /// announcement channel.
@@ -59,6 +72,9 @@ pub struct ChatRoom {
     /// The Discord category the channel is listed under, or for a message
     /// request "Message requests" or "Spam"; empty for none.
     pub category: String,
+    /// The room id of that Discord category, which tells it from others of
+    /// the same name; shared by its channels.
+    pub category_id: Option<Arc<str>>,
     /// A Discord message request: readable, but answered by accepting or
     /// ignoring it before replying.
     pub request: bool,
@@ -79,10 +95,43 @@ pub struct ChatRoom {
     /// Discord says, and their custom status or what they're doing.
     pub presence: Option<Presence>,
     pub activity: Option<String>,
+    /// What they're doing, in full, as their profile shows it.
+    pub activities: Activities,
     /// A Discord thread's channel, by room id: the thread lists under it.
     pub parent: Option<String>,
     /// A Discord forum, whose posts show in place of messages.
     pub forum: bool,
+    /// A Discord message request's latest message, when it's known.
+    pub preview: Option<Box<RequestPreview>>,
+}
+
+impl ChatRoom {
+    /// It has messages: every room but a Matrix voice room, as a Discord
+    /// voice channel has a chat beside its call.
+    pub fn has_text(&self) -> bool {
+        !self.voice || self.network == Network::Discord
+    }
+
+    /// A voice channel with a chat beside its call that this account may
+    /// read.
+    pub fn voice_chat(&self) -> bool {
+        self.voice && self.has_text() && !self.locked
+    }
+
+    /// A call here is end-to-end encrypted: Discord's always are, by DAVE,
+    /// and a Matrix room's when the room is.
+    pub fn call_encrypted(&self) -> bool {
+        self.network == Network::Discord || self.encrypted
+    }
+}
+
+/// A Discord message request's latest message, as the requests list shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RequestPreview {
+    /// Plain text on one line, or what files it carries.
+    pub text: String,
+    /// When it came, in Unix milliseconds.
+    pub at: u64,
 }
 
 /// The most files one message carries, as Discord allows.
@@ -128,6 +177,7 @@ pub struct Friend {
     /// what they're doing.
     pub presence: Option<Presence>,
     pub activity: Option<String>,
+    pub activities: Activities,
 }
 
 /// A file waiting in the composer to go with the next message.
@@ -365,6 +415,11 @@ pub enum Permission {
     CreatePrivateThreads,
     /// Remove others' reactions, among more.
     ManageMessages,
+    /// Post polls, besides sending messages.
+    SendPolls,
+    /// Manage threads and forum posts, and give posts a forum's moderated
+    /// tags.
+    ManageThreads,
     /// Join a voice channel.
     Connect,
     /// Mute, deafen, and move or disconnect members in voice channels.
@@ -481,6 +536,7 @@ pub struct Profile {
     pub bio: String,
     pub presence: Option<Presence>,
     pub activity: Option<String>,
+    pub activities: Activities,
     /// Their roles, highest first: Discord roles in this server, or Matrix
     /// room roles above member.
     pub roles: Vec<ProfileRole>,
@@ -543,8 +599,10 @@ pub struct ChatMember {
     pub presence: Option<Presence>,
     /// The RGB colour of their name, from their highest coloured Discord role.
     pub color: Option<u32>,
-    /// Their custom status, else what they're doing, from Discord.
+    /// Their custom status, else what they're doing, from Discord, and
+    /// what they're doing in full.
     pub activity: Option<String>,
+    pub activities: Activities,
     /// Their Discord roles' ids, as far as they're known, shared with what
     /// learned them; empty for Matrix. See [`crate::application::Application::server_roles`].
     pub roles: Arc<[String]>,
@@ -692,6 +750,8 @@ pub struct ForumTag {
     pub id: String,
     pub name: String,
     pub emoji: Option<ShownEmoji>,
+    /// Only those who manage threads may give it.
+    pub moderated: bool,
 }
 
 /// Someone a thread's row names.
@@ -971,8 +1031,6 @@ enum AnimationFormat {
     WebP,
     #[cfg(feature = "discord")]
     Video,
-    #[cfg(feature = "discord")]
-    Lottie,
 }
 
 impl Picture {
@@ -987,22 +1045,6 @@ impl Picture {
             return Box::new(std::iter::empty());
         };
         let frames: Box<dyn Iterator<Item = Vec<u8>>> = match animation.format {
-            #[cfg(feature = "discord")]
-            AnimationFormat::Lottie => {
-                use std::io::Read;
-                let mut data = Vec::new();
-                if file
-                    .take(2 * 1024 * 1024 + 1)
-                    .read_to_end(&mut data)
-                    .is_err()
-                {
-                    return Box::new(std::iter::empty());
-                }
-                match crate::lottie::Frames::new(&data, width, height) {
-                    Some(frames) => Box::new(frames),
-                    None => Box::new(std::iter::empty()),
-                }
-            }
             #[cfg(feature = "discord")]
             AnimationFormat::Video => crate::video::frames(file, width, height),
             format => match image_frames(file, format) {
@@ -1206,6 +1248,86 @@ pub struct ChatMessage {
     pub can_pin: bool,
     /// The Discord thread it started, or that it tells of.
     pub thread: Option<ThreadLink>,
+    /// The Discord poll it asks.
+    pub poll: Option<Poll>,
+    /// What it tells of, when it's a notice in place of a message, such as
+    /// Discord's that someone pinned one; its body says it after its
+    /// author's name.
+    pub notice: Option<Notice>,
+}
+
+/// A notice in place of a message, as Discord's client marks it: with an
+/// icon, its author's name, and what it tells of.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Notice {
+    pub kind: NoticeKind,
+    /// What follows the author's name, such as "joined the server."
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NoticeKind {
+    /// Its author pinned a message, by item, which it links to.
+    Pinned(Option<String>),
+    Joined,
+    ThreadStarted,
+    Call,
+    PollResult,
+}
+
+/// A Discord poll as a message shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Poll {
+    pub question: String,
+    pub answers: Vec<PollAnswer>,
+    /// When it closes, in seconds since the Unix epoch.
+    pub expiry: Option<u64>,
+    /// It takes votes no more: Discord counted them for the last time.
+    pub finalized: bool,
+    /// One may pick several answers.
+    pub multiselect: bool,
+    /// This account may close it now: its author.
+    pub can_end: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PollAnswer {
+    pub id: u64,
+    pub text: String,
+    /// Its emoji, as a reaction's key: the emoji itself, or `:name:` for a
+    /// custom one, among the message's [`ChatMessage::emoji`].
+    pub emoji: Option<String>,
+    pub votes: usize,
+    pub mine: bool,
+}
+
+/// A Discord poll to post.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NewPoll {
+    pub question: String,
+    pub answers: Vec<NewPollAnswer>,
+    /// How long it takes votes, in hours.
+    pub hours: u32,
+    pub multiselect: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NewPollAnswer {
+    pub text: String,
+    /// The emoji itself, or a custom one's `name:id`, as a reaction takes it.
+    pub emoji: Option<String>,
+}
+
+impl Poll {
+    /// Whether it takes votes no more at `now`, in seconds since the Unix epoch.
+    pub fn closed(&self, now: u64) -> bool {
+        self.finalized || self.expiry.is_some_and(|expiry| expiry <= now)
+    }
+
+    /// This account voted.
+    pub fn voted(&self) -> bool {
+        self.answers.iter().any(|answer| answer.mine)
+    }
 }
 
 impl ChatMessage {
@@ -1330,6 +1452,33 @@ pub enum Command {
         room: String,
         item: String,
         key: String,
+        after: Option<String>,
+        limit: u32,
+    },
+    /// Vote for `answers` of a Discord poll in place of this account's vote;
+    /// none takes it back.
+    Vote {
+        room: String,
+        item: String,
+        answers: Vec<u64>,
+    },
+    /// Post a poll in a Discord conversation. [`Event::PollPosted`] follows.
+    SendPoll {
+        room: String,
+        poll: NewPoll,
+    },
+    /// Close this account's Discord poll now.
+    EndPoll {
+        room: String,
+        item: String,
+    },
+    /// Who voted for `answer` of a Discord poll, as [`Command::Reactors`]
+    /// asks who reacted. [`Event::Reactors`] follows, with the answer's id
+    /// as its key.
+    Voters {
+        room: String,
+        item: String,
+        answer: u64,
         after: Option<String>,
         limit: u32,
     },
@@ -1654,6 +1803,16 @@ pub enum DiscordCommand {
         private: bool,
         location: &'static str,
     },
+    /// Post in a Discord forum, by its room id: a post named `title` with
+    /// the forum's tags by id, and a first message of `body` and `files`.
+    /// [`Event::ForumPosted`] follows.
+    PostInForum {
+        room: String,
+        title: String,
+        tags: Vec<String>,
+        body: String,
+        files: Vec<OutgoingFile>,
+    },
     /// Look for messages a search box's `query`, filters and all, finds: in
     /// a Discord DM, by its room id, or a server, by its server id; a page
     /// from the `offset`th found. [`Event::Found`] follows.
@@ -1925,6 +2084,10 @@ impl Command {
             | Command::Edit { room, .. }
             | Command::React { room, .. }
             | Command::Reactors { room, .. }
+            | Command::Vote { room, .. }
+            | Command::SendPoll { room, .. }
+            | Command::EndPoll { room, .. }
+            | Command::Voters { room, .. }
             | Command::RemoveReactor { room, .. }
             | Command::Delete { room, .. }
             | Command::Pin { room, .. }
@@ -2059,6 +2222,12 @@ pub enum Event {
     /// [`DiscordCommand::StartThread`]'s thread, by room id, in the channel
     /// `room`, or why it didn't start.
     ThreadStarted {
+        room: String,
+        result: Result<String, String>,
+    },
+    /// [`DiscordCommand::PostInForum`]'s post, by room id, in the forum
+    /// `room`, or why it wasn't made.
+    ForumPosted {
         room: String,
         result: Result<String, String>,
     },
@@ -2202,7 +2371,8 @@ pub enum Event {
         item: String,
         result: Result<(), String>,
     },
-    /// [`Command::Reactors`]'s page, or why it didn't come.
+    /// [`Command::Reactors`]'s page, or [`Command::Voters`]', or why it
+    /// didn't come.
     Reactors {
         room: String,
         item: String,
@@ -2210,6 +2380,11 @@ pub enum Event {
         after: Option<String>,
         limit: u32,
         result: Result<Vec<Reactor>, String>,
+    },
+    /// [`Command::SendPoll`]'s poll went up in `room`, or why it didn't.
+    PollPosted {
+        room: String,
+        result: Result<(), String>,
     },
     /// A message was forwarded to `room`, with the message added to it, or
     /// what fell short.
@@ -2283,25 +2458,6 @@ fn decode_kept_picture(
     height: u32,
     kept: Option<&std::path::Path>,
 ) -> Option<Picture> {
-    #[cfg(feature = "discord")]
-    if data
-        .iter()
-        .copied()
-        .find(|byte| !byte.is_ascii_whitespace())
-        == Some(b'{')
-    {
-        let mut frames = crate::lottie::Frames::new(data, width, height)?;
-        return Some(Picture {
-            width: frames.width,
-            height: frames.height,
-            rgba: Pixels::new(frames.width, frames.height, frames.next()?),
-            animation: Some(Animation {
-                delays: std::mem::take(&mut frames.delays),
-                file: AnimationFile::of(data, kept),
-                format: AnimationFormat::Lottie,
-            }),
-        });
-    }
     #[cfg(feature = "discord")]
     if crate::video::is_video(data) {
         return crate::video::decode_kept_animation(data, width, height, kept);
@@ -2379,7 +2535,7 @@ fn frame_delays(data: &[u8], format: AnimationFormat) -> Option<Vec<u32>> {
         AnimationFormat::Png => apng_delays(data)?,
         AnimationFormat::WebP => webp_delays(data)?,
         #[cfg(feature = "discord")]
-        AnimationFormat::Video | AnimationFormat::Lottie => return None,
+        AnimationFormat::Video => return None,
     };
     // Browsers show frames meant for under 20 ms for 100 ms.
     Some(
@@ -2503,7 +2659,7 @@ fn image_frames<'a>(
             Some((size, decoder.into_frames()))
         }
         #[cfg(feature = "discord")]
-        AnimationFormat::Video | AnimationFormat::Lottie => None,
+        AnimationFormat::Video => None,
     }
 }
 

@@ -27,16 +27,16 @@ import { ActionButton, IconButton, PingToggle, DeviceToggle, Avatar, TextField, 
 import { PersonRow, CallLink, CallLinkCard, LinkTouch, SignalIcon, VoiceDock, StreamPip, CallInvite, JoinVoice, StreamView, ParticipantGrid, CallControls, IncomingCall, SwitchDialog, InputLevel, ShareMenu, ShareScreen, VolumeMenu } from "voice.slint";
 import { ServerRow, RoomRow, StatusDot, ServerRail, ServerHeader, RoomList } from "rail.slint";
 import { StagedFile, StagedTile, Composer, MentionRow, MentionList, EmojiSuggestions, RequestBar } from "composer.slint";
-import { EmojiCell, EmojiRow, EmojiSection, MessageRow, ReactionToggle, EmojiButton, EmojiPicker, MessageMenu, MessageGallery, MessageStickers, FileCard, MessageContent, EmbedView, BotTag, NoConversation, ConversationStart, HistoryEdge, UnreadBar, PresentBar, ImageViewer, VideoViewer, VideoPlayer } from "messages.slint";
+import { EmojiCell, EmojiRow, EmojiSection, MessageRow, ReactionToggle, EmojiButton, EmojiPicker, MessageMenu, MessageGallery, MessageStickers, FileCard, MessageContent, EmbedView, BotTag, NoConversation, ConversationStart, HistoryEdge, UnreadBar, PresentBar, ImageViewer, VideoViewer, VideoPlayer, Polls } from "messages.slint";
 import { SettingsScreen, AccountSettings, AppearanceSettings, ThemeCard, ThemeColour, VoiceSettings, MessageSettings, NotificationSettings, SoundSettings, AdvancedSettings, DiscordLinkSettings, DiscordSettings, GameActivitySettings, GameExecutable } from "settings.slint";
 import { MemberRow, ProfileData, ProfileServerRow, MemberPanel, ProfileCard, ServerCard, RoleCard } from "people.slint";
-import { FriendRequestRow, FriendRow, FriendsScreen, HeaderTab, RequestsScreen, AddFriendDialog } from "friends.slint";
-import { ContactRow, ForwardRow, ReactionPill, ReactorRow, StatusDialog, NewDmDialog, ForwardDialog, ReactionsDialog, StatusMenu, PersonPrompt, PersonDialog, LeavingDialog } from "dialogs.slint";
+import { RequestRow, FriendRow, FriendsScreen, HeaderTab, RequestsScreen, AddFriendDialog } from "friends.slint";
+import { ContactRow, ForwardRow, ReactionPill, ReactorRow, StatusDialog, NewDmDialog, ForwardDialog, ReactionsDialog, StatusMenu, PersonPrompt, PersonDialog, LeavingDialog, PollAnswerDraft, PollDialog } from "dialogs.slint";
 import { InvitePrompt, InviteDialog, ChannelPrompt, ChannelDialog, ServerProfilePrompt, ServerProfileDialog } from "server.slint";
 import { SignInScreen, VerifyBanner } from "sign-in.slint";
 import { FoundRow, PickRow, ThreadRow, HeaderSearch, PinsPopover, ThreadsPopover, AddPeoplePopover, SearchPanel, TopicPopover } from "header.slint";
 import { ThreadPanel, NewThreadPanel } from "thread.slint";
-import { PostTag, PostRow, ForumPanel } from "forum.slint";
+import { PostTag, PostRow, PostTagChoice, ForumPanel } from "forum.slint";
 
 // Rust sees these, besides YapfastWindow.
 export { Theme, Badges } from "theme.slint";
@@ -44,10 +44,10 @@ export { PersonRow, CallLink, ShareScreen } from "voice.slint";
 export { ServerRow, RoomRow, FolderServer } from "rail.slint";
 export { PictureStore, Motion } from "controls.slint";
 export { StagedFile, MentionRow } from "composer.slint";
-export { EmojiCell, EmojiRow, EmojiSection, ReactionChip, ImageCell, FileCell, EmbedField, EmbedFieldRow, EmbedCard, MessageRow, VideoPlayer } from "messages.slint";
-export { MemberRow, ProfileRole, ProfileRoleRow, ProfileServerRow, ProfileFriendRow, ProfileData } from "people.slint";
-export { FriendRequestRow, FriendRow } from "friends.slint";
-export { ContactRow, ForwardRow, ReactionPill, ReactorRow } from "dialogs.slint";
+export { EmojiCell, EmojiRow, EmojiSection, ReactionChip, ImageCell, FileCell, EmbedField, EmbedFieldRow, EmbedCard, MessageRow, VideoPlayer, PollAction, PollAnswerRow, PollCard, Polls } from "messages.slint";
+export { MemberRow, ProfileRole, ProfileRoleRow, ProfileServerRow, ProfileFriendRow, ProfileData, ActivityRow, ActivityClock } from "people.slint";
+export { RequestRow, FriendRow } from "friends.slint";
+export { ContactRow, ForwardRow, ReactionPill, ReactorRow, PollAnswerDraft } from "dialogs.slint";
 export { FoundRow, PickRow } from "header.slint";
 export { GifTile, GifFavorites } from "gifs.slint";
 
@@ -185,8 +185,6 @@ export component YapfastWindow inherits Window {
     /// The account is speaking in the call, unmuted, as its own row there shows.
     in property <bool> account-speaking;
     in property <string> account-status;
-    in property <string> game-activity-name;
-    in property <string> game-activity-duration;
     /// The address of the picture of the custom emoji in the account's status.
     in property <string> account-status-emoji;
     in property <string> storage;
@@ -264,20 +262,20 @@ export component YapfastWindow inherits Window {
     callback sync-discord-reads-toggled(bool);
     in-out property <bool> show-idle: true;
     callback show-idle-toggled(bool);
-    in-out property <bool> game-activity-enabled: true;
-    in property <[GameExecutable]> game-executables;
-    callback game-activity-toggled(bool);
-    callback save-game-executable(int, string, string) -> bool;
-    callback remove-game-executable(int);
     in-out property <bool> hide-blocked;
     callback hide-blocked-toggled(bool);
     in property <bool> room-selected;
     in property <bool> room-ready;
     in property <bool> room-encrypted;
     in property <bool> voice-room;
-    in property <bool> voice-text;
-    property <string> voice-chat-room;
-    property <bool> voice-panel: root.voice-room && !(root.voice-text && root.voice-chat-room == root.room-id);
+    /// The selected voice channel shows its chat in place of its call, and
+    /// whether it has one to show.
+    in property <bool> voice-chat;
+    in property <bool> has-voice-chat;
+    /// A call here would be end-to-end encrypted.
+    in property <bool> call-encrypted;
+    /// A voice room shows its call, rather than its chat.
+    property <bool> voice-panel: root.voice-room && !root.voice-chat;
     in property <bool> composer-enabled;
     /// The selected conversation is a Discord message request, introduced by
     /// the title; it's answered instead of written to.
@@ -430,6 +428,8 @@ export component YapfastWindow inherits Window {
     in property <string> reaction-tip-emoji;
     /// A message's Reactions window; see ReactionsDialog.
     in property <bool> reactions-open;
+    /// The Reactions window lists who voted for each answer of a poll.
+    in property <bool> reactions-voters;
     in property <[ReactionPill]> reaction-pills;
     in property <string> reactions-key;
     in property <[ReactorRow]> reactor-rows;
@@ -584,11 +584,12 @@ export component YapfastWindow inherits Window {
     /// The prompt joins a call from none, to watch a stream; it stays set
     /// while the prompt fades.
     in property <bool> switch-joins;
-    /// Discord friend requests, message requests and spam, on the requests
-    /// screen, which the top of the DM list opens.
-    in property <[FriendRequestRow]> friend-requests;
-    in property <[RoomRow]> message-requests;
-    in property <[RoomRow]> spam-rooms;
+    /// Discord friend requests and message requests, each person's together,
+    /// on the requests screen, which the top of the DM list opens: those
+    /// waiting for an answer, those this account sent, and spam.
+    in property <[RequestRow]> requests-incoming;
+    in property <[RequestRow]> requests-sent;
+    in property <[RequestRow]> requests-spam;
     in property <bool> requests-open;
     /// The Discord friends list, the friends around in it, and how many
     /// friends there are before its search.
@@ -631,6 +632,15 @@ export component YapfastWindow inherits Window {
     in property <[FoundRow]> pins;
     in property <string> pins-note;
     callback show-pins(bool);
+    /// The header's pin button's bottom right corner, under which the pins open.
+    property <length> pins-anchor-x;
+    property <length> pins-anchor-y;
+    /// Opens the pins under the header's pin button, as a pin's notice does.
+    public function open-pins() {
+        root.popover-x = root.pins-anchor-x;
+        root.popover-y = root.pins-anchor-y;
+        root.show-pins(true);
+    }
     // The open channel's list of its threads; see ThreadsPopover.
     in property <bool> can-list-threads;
     in property <bool> threads-open;
@@ -659,6 +669,56 @@ export component YapfastWindow inherits Window {
     in property <bool> posts-loading;
     callback search-posts(string);
     callback more-posts;
+    // The form for a post in the forum; see NewPostForm. Its files are the
+    // staged ones.
+    in property <bool> can-post;
+    in property <bool> post-composing;
+    in-out property <string> post-title;
+    in-out property <string> post-body;
+    in property <[PostTagChoice]> post-chosen-tags;
+    in property <[PostTagChoice]> post-tag-choices;
+    in property <bool> post-tag-required;
+    in property <bool> post-more-tags;
+    /// The forum's topic: its post guidelines.
+    in property <styled-text> post-guidelines;
+    in property <bool> post-has-guidelines;
+    in property <bool> posting;
+    in property <string> post-error;
+    in property <bool> post-leaving;
+    callback new-post;
+    callback post-title-edited(string);
+    callback post-body-edited(string);
+    callback toggle-post-tag(string);
+    callback create-post;
+    callback close-post;
+    callback leave-post;
+    callback stay-post;
+    // Making a poll; see PollDialog.
+    /// Polls can be made in the open conversation.
+    in property <bool> can-create-polls;
+    in property <bool> poll-open;
+    in-out property <string> poll-question;
+    in property <string> poll-question-count;
+    in property <[PollAnswerDraft]> poll-answers;
+    in property <int> poll-duration;
+    in property <bool> poll-multiselect;
+    in property <bool> poll-can-add;
+    in property <bool> poll-can-post;
+    in property <bool> poll-posting;
+    in property <string> poll-problem;
+    callback open-poll;
+    callback poll-question-edited(string);
+    callback poll-answer-edited(int, string);
+    /// An answer's emoji, by its key, or with "" none.
+    callback poll-answer-emoji(int, string);
+    callback poll-add-answer;
+    callback poll-remove-answer(int);
+    callback poll-duration-chosen(int);
+    callback poll-multiselect-set(bool);
+    callback post-poll;
+    callback close-poll;
+    /// The answer whose emoji the picker is choosing.
+    property <int> poll-emoji-answer;
     // Starting a thread; see NewThreadPanel.
     /// Threads can start from the open channel's messages.
     in property <bool> can-start-threads;
@@ -737,7 +797,7 @@ export component YapfastWindow inherits Window {
     in property <color> incoming-tint;
     in property <image> incoming-picture;
     /// The settings screen covers the window, showing one section: 0 account, 1 voice and
-    /// audio, 2 messages, 3 notifications, 4 Discord, 5 sounds, 8 game activity.
+    /// audio, 2 messages, 3 notifications, 4 Discord, 5 sounds.
     in-out property <bool> settings-open;
     // Closing settings stops linking Discord there.
     changed settings-open => {
@@ -769,6 +829,13 @@ export component YapfastWindow inherits Window {
     in-out property <float> gate-level: -100;
     in-out property <bool> gate-sending;
     in-out property <string> gate-meter-note;
+    /// Push to talk: see VoiceSettings.
+    in-out property <int> input-mode;
+    in-out property <string> talk-key;
+    in-out property <bool> talk-recording;
+    in-out property <int> talk-delay: 20;
+    in-out property <string> talk-note;
+    callback record-talk-key(bool);
     in-out property <bool> share-typing: true;
     in-out property <bool> notifications: true;
     in-out property <bool> notification-text: true;
@@ -794,12 +861,6 @@ export component YapfastWindow inherits Window {
     in property <bool> autostart-available;
     callback restart();
     callback preferences-changed();
-    callback choose-custom-icon();
-    callback reset-custom-icon();
-    callback choose-tray-idle-icon();
-    callback reset-tray-idle-icon();
-    callback choose-tray-speaking-icon();
-    callback reset-tray-speaking-icon();
     /// The built-in themes, and the one shown by its id; choose-theme shows
     /// and keeps another.
     in property <[ThemeCard]> themes;
@@ -815,14 +876,6 @@ export component YapfastWindow inherits Window {
     in property <[string]> theme-starts;
     in property <int> theme-start;
     in property <bool> theme-can-save;
-    in-out property <bool> tray-voice-activity: true;
-    in-out property <int> icon-style: 0;
-    in property <bool> has-custom-icon;
-    in property <bool> has-tray-idle-icon;
-    in property <bool> has-tray-speaking-icon;
-    in property <image> app-icon-preview;
-    in property <image> tray-idle-icon-preview;
-    in property <image> tray-speaking-icon-preview;
     callback new-theme();
     callback edit-theme(string);
     callback theme-start-chosen(int);
@@ -867,6 +920,11 @@ export component YapfastWindow inherits Window {
     /// Go to wherever a conversation is listed and open it, as an unread DM
     /// on the rail does.
     callback open-conversation(string);
+    /// Go to a conversation and show its messages: a voice channel's chat
+    /// rather than its call.
+    callback open-chat(string);
+    /// Show the selected voice channel's chat, or with `false` its call.
+    callback show-voice-chat(bool);
     /// Show a Discord thread beside the conversation, as its link in a
     /// message does, asking for one that isn't listed.
     callback open-aside(string);
@@ -1173,7 +1231,7 @@ export component YapfastWindow inherits Window {
     changed input-open => { root.input-level = 0; root.meter-note = ""; root.metering(root.input-open); }
     Timer { interval: 50ms; running: root.input-open; triggered => { root.meter-tick(); } }
     // The Discord gate's meter runs while voice settings show it.
-    property <bool> gate-metered: root.settings-open && root.settings-section == 1 && root.discord-linked;
+    property <bool> gate-metered: root.settings-open && root.settings-section == 1 && root.discord-linked && root.input-mode == 0;
     // Cameras stop making pictures for a grid that left the screen.
     changed grid-shown => { root.stream-tick(); }
     // The camera films for the preview only while the voice settings show it.
@@ -1341,9 +1399,14 @@ export component YapfastWindow inherits Window {
                     text: "Upload a File"; icon: @image-url("icons/file.svg"); disabled: !root.can-attach;
                     clicked => { if root.can-attach { plus-menu.close(); root.attach(); } }
                 }
-                MenuItem {
+                // Closing the menu takes these away, so they act first.
+                if root.can-start-threads: MenuItem {
                     text: "Create Thread"; icon: @image-url("icons/messages-square.svg");
-                    clicked => { plus-menu.close(); root.new-thread("", "plus"); }
+                    clicked => { root.new-thread("", "plus"); plus-menu.close(); }
+                }
+                if root.can-create-polls: MenuItem {
+                    text: "Create Poll"; icon: @image-url("icons/chart-bar.svg");
+                    clicked => { root.open-poll(); plus-menu.close(); }
                 }
             }
         }
@@ -1355,7 +1418,6 @@ export component YapfastWindow inherits Window {
         close-policy: PopupClosePolicy.close-on-click-outside;
         status-menu-content := StatusMenu {
             status: root.discord-status; has-custom-status: root.has-custom-status;
-            game-name: root.game-activity-name; game-duration: root.game-activity-duration;
             choose(status) => { root.set-status(status); status-menu.close(); }
             custom-status => { root.open-status(); status-menu.close(); }
         }
@@ -1391,6 +1453,8 @@ export component YapfastWindow inherits Window {
     function pick(cell: EmojiCell) {
         if root.react-item == "yapfast:status" {
             root.status-emoji = cell;
+        } else if root.react-item == "yapfast:poll" {
+            root.poll-answer-emoji(root.poll-emoji-answer, cell.key);
         } else if root.react-item == "yapfast:composer" {
             root.insert-emoji(cell.key);
         } else {
@@ -1551,6 +1615,7 @@ export component YapfastWindow inherits Window {
             copy-text(text) => { root.copy-text(text); message-menu.close(); }
             pin-message(item) => { root.pin-message(item); message-menu.close(); }
             request-delete(item) => { root.request-delete(item); message-menu.close(); }
+            end-poll(item) => { Polls.ask-end(item); message-menu.close(); }
             media-index: root.menu-media; media-video: root.menu-video; media-link: root.menu-link;
             copy-image(item, index) => { root.copy-attachment(item, index); message-menu.close(); }
             save-attachment(item, index) => { root.save-attachment(item, index); message-menu.close(); }
@@ -1637,8 +1702,9 @@ export component YapfastWindow inherits Window {
                                 rooms: root.rooms; dms-selected: root.dms-selected; discord-linked: root.discord-linked; preview: root.preview;
                                 friends-open: root.friends-open; requests-current: root.requests-current; requests-badge: root.requests-badge;
                                 voice-channel: root.voice-channel; participants: root.participants; sidebar-empty: root.sidebar-empty;
-                    select-room(id) => { root.voice-chat-room = ""; root.select-room(id); }
-                    open-chat(id) => { root.voice-chat-room = id; root.open-conversation(id); }
+                                select-room(id) => { root.select-room(id); }
+                                open-voice(id) => { root.open-conversation(id); }
+                                open-chat(id) => { root.open-chat(id); }
                                 open-friends => { root.open-friends(); }
                                 open-requests => { root.open-requests(); }
                                 open-room-menu(id, x, y) => { root.open-context-menu(id, false, x, y); }
@@ -1651,7 +1717,7 @@ export component YapfastWindow inherits Window {
                                         root.show-profile(person.person);
                                     }
                                 }
-                                toggle-category(heading) => { root.toggle-category(heading); }
+                                toggle-category(category) => { root.toggle-category(category); }
                                 open-category-menu(id, x, y) => {
                                     if root.category-of(id) != "" { root.open-context-menu(root.category-of(id), false, x, y); }
                                 }
@@ -1862,12 +1928,12 @@ export component YapfastWindow inherits Window {
                                 clicked => { root.befriend(root.dm-person); }
                             }
                         }
-                        if root.voice-text: Middle {
+                        if root.has-voice-chat: Middle {
                             IconButton {
-                                icon: root.voice-panel ? @image-url("icons/message-square-text.svg") : @image-url("icons/volume-2.svg");
-                                label: root.voice-panel ? "Open chat" : "Show voice channel";
+                                icon: root.voice-chat ? @image-url("icons/volume-2.svg") : @image-url("icons/message-square-text.svg");
+                                label: root.voice-chat ? "Show voice channel" : "Open chat";
                                 tip-side: 2;
-                                clicked => { root.voice-chat-room = root.voice-panel ? root.room-id : ""; }
+                                clicked => { root.show-voice-chat(!root.voice-chat); }
                             }
                         }
                         if root.can-call: Middle {
@@ -1905,9 +1971,15 @@ export component YapfastWindow inherits Window {
                                 icon: @image-url("icons/pin.svg"); label: "Pinned messages";
                                 size: 32px; glyph: 20px; tip-side: 2;
                                 tint: root.pins-open ? Theme.text : Theme.secondary;
+                                // Where the pins open from elsewhere, such as a pin's notice.
+                                property <length> anchor-x: self.absolute-position.x + self.width;
+                                property <length> anchor-y: self.absolute-position.y + self.height;
+                                init => { root.pins-anchor-x = self.anchor-x; root.pins-anchor-y = self.anchor-y; }
+                                changed anchor-x => { root.pins-anchor-x = self.anchor-x; }
+                                changed anchor-y => { root.pins-anchor-y = self.anchor-y; }
                                 clicked => {
-                                    root.popover-x = self.absolute-position.x + self.width;
-                                    root.popover-y = self.absolute-position.y + self.height;
+                                    root.popover-x = self.anchor-x;
+                                    root.popover-y = self.anchor-y;
                                     root.show-pins(!root.pins-open);
                                 }
                             }
@@ -2029,7 +2101,7 @@ export component YapfastWindow inherits Window {
                             if !root.voice-panel: Rectangle { y: parent.height - 1px; height: 1px; background: Theme.edge; }
                             if !root.voice-here && root.voice-panel: JoinVoice {
                                 room-name: root.room-name; voice-description: root.voice-description; preview: root.preview;
-                                room-encrypted: root.voice-text || root.room-encrypted; voice-active: root.voice-active; can-join: root.can-join;
+                                call-encrypted: root.call-encrypted; voice-active: root.voice-active; can-join: root.can-join;
                                 join-voice => { root.join-voice(); }
                             }
                             if root.voice-here: VerticalLayout {
@@ -2079,9 +2151,28 @@ export component YapfastWindow inherits Window {
                             searching: root.posts-searching; searchable: root.posts-searchable;
                             query <=> root.posts-query;
                             more: root.posts-more; loading: root.posts-loading;
+                            can-post: root.can-post; composing: root.post-composing;
+                            post-title <=> root.post-title; post-body <=> root.post-body;
+                            chosen-tags: root.post-chosen-tags; tag-choices: root.post-tag-choices;
+                            tag-required: root.post-tag-required; more-tags: root.post-more-tags;
+                            guidelines: root.post-guidelines; has-guidelines: root.post-has-guidelines;
+                            staged: root.staged; can-attach: root.can-attach; can-mark-spoilers: root.can-mark-spoilers;
+                            posting: root.posting; post-error: root.post-error; leaving: root.post-leaving;
                             search(text) => { root.search-posts(text); }
                             more-posts => { root.more-posts(); }
                             open(room, beside) => { root.open-listed-thread(room, beside); }
+                            new-post => { root.new-post(); }
+                            post-title-edited(text) => { root.post-title-edited(text); }
+                            post-body-edited(text) => { root.post-body-edited(text); }
+                            toggle-tag(id) => { root.toggle-post-tag(id); }
+                            attach => { root.attach(); }
+                            unstage(index) => { root.unstage(index); }
+                            toggle-spoiler(index) => { root.toggle-spoiler(index); }
+                            create-post => { root.create-post(); }
+                            close-post => { root.close-post(); }
+                            leave-post => { root.leave-post(); }
+                            stay-post => { root.stay-post(); }
+                            open-link(link) => { root.open-link(link); }
                         }
                         // Text conversation.
                         Rectangle {
@@ -2373,9 +2464,9 @@ export component YapfastWindow inherits Window {
                             }
                             if root.requests-open: RequestsScreen {
                                 width: parent.width; height: parent.height;
-                                friend-requests: root.friend-requests;
-                                message-requests: root.message-requests;
-                                spam: root.spam-rooms;
+                                incoming: root.requests-incoming;
+                                sent: root.requests-sent;
+                                spam: root.requests-spam;
                                 accept(id) => { root.befriend(id); }
                                 remove(id) => { root.remove-friend-request(id); }
                                 open(id) => { root.select-room(id); }
@@ -2387,6 +2478,7 @@ export component YapfastWindow inherits Window {
                                 filter <=> root.friend-filter;
                                 filter-edited => { root.friend-filter-edited(); }
                                 message(id) => { root.message-friend(id); }
+                                open-voice(id) => { root.open-conversation(id); }
                                 add-friend => { root.open-add-friend(); }
                                 open-friend-menu(id, x, y) => { root.open-context-menu(id, true, x, y); }
                             }
@@ -2486,11 +2578,11 @@ export component YapfastWindow inherits Window {
                                             // of uploading a file or starting a thread.
                                             IconButton {
                                                 icon: @image-url("icons/circle-plus.svg");
-                                                label: root.can-start-threads ? "More options" : "Attach files";
+                                                label: root.can-start-threads || root.can-create-polls ? "More options" : "Attach files";
                                                 glyph: 22px;
-                                                enabled: root.can-attach || root.can-start-threads;
+                                                enabled: root.can-attach || root.can-start-threads || root.can-create-polls;
                                                 clicked => {
-                                                    if root.can-start-threads {
+                                                    if root.can-start-threads || root.can-create-polls {
                                                         root.menu-x = self.absolute-position.x;
                                                         root.menu-y = self.absolute-position.y;
                                                         plus-menu.show();
@@ -2811,26 +2903,11 @@ export component YapfastWindow inherits Window {
         }
         if root.settings-section == 7: AppearanceSettings {
             themes: root.themes; theme-id: root.theme-id;
-            tray-voice-activity <=> root.tray-voice-activity;
-            icon-style <=> root.icon-style;
-            has-custom-icon: root.has-custom-icon;
-            has-tray-idle-icon: root.has-tray-idle-icon;
-            has-tray-speaking-icon: root.has-tray-speaking-icon;
-            app-icon-preview: root.app-icon-preview;
-            tray-idle-icon-preview: root.tray-idle-icon-preview;
-            tray-speaking-icon-preview: root.tray-speaking-icon-preview;
             editor: root.theme-editor; colours: root.theme-colours;
             theme-name <=> root.theme-name; theme-dark <=> root.theme-dark;
             editing-saved: root.theme-editing-saved; starts: root.theme-starts; start-index: root.theme-start;
             can-save: root.theme-can-save;
             choose-theme(id) => { root.choose-theme(id); }
-            preferences-changed => { root.preferences-changed(); }
-            choose-custom-icon => { root.choose-custom-icon(); }
-            reset-custom-icon => { root.reset-custom-icon(); }
-            choose-tray-idle-icon => { root.choose-tray-idle-icon(); }
-            reset-tray-idle-icon => { root.reset-tray-idle-icon(); }
-            choose-tray-speaking-icon => { root.choose-tray-speaking-icon(); }
-            reset-tray-speaking-icon => { root.reset-tray-speaking-icon(); }
             new-theme => { root.new-theme(); }
             edit-theme(id) => { root.edit-theme(id); }
             start-chosen(index) => { root.theme-start-chosen(index); }
@@ -2848,6 +2925,9 @@ export component YapfastWindow inherits Window {
             unmute-on-join <=> root.unmute-on-join; level-voice <=> root.level-voice;
             noise-suppression <=> root.noise-suppression; noise-strength <=> root.noise-strength; dereverb <=> root.dereverb; discord: root.discord-linked;
             sensitivity <=> root.sensitivity; gate-level: root.gate-level; gate-sending: root.gate-sending; gate-meter-note: root.gate-meter-note;
+            input-mode <=> root.input-mode; talk-key: root.talk-key; talk-recording <=> root.talk-recording;
+            talk-delay <=> root.talk-delay; talk-note: root.talk-note;
+            record-talk-key(on) => { root.record-talk-key(on); }
             select-microphone(index) => { root.select-microphone(index); }
             select-speaker(index) => { root.select-speaker(index); }
             select-camera(index) => { root.select-camera(index); }
@@ -2882,12 +2962,6 @@ export component YapfastWindow inherits Window {
             start-on-sign-in <=> root.start-on-sign-in; autostart-available: root.autostart-available;
             preferences-changed => { root.preferences-changed(); }
             restart => { root.restart(); }
-        }
-        if root.settings-section == 8: GameActivitySettings {
-            enabled: root.game-activity-enabled; executables: root.game-executables;
-            toggled(enabled) => { root.game-activity-toggled(enabled); }
-            save(index, executable, text) => { return root.save-game-executable(index, executable, text); }
-            remove(index) => { root.remove-game-executable(index); }
         }
         if root.settings-section == 4 && !root.discord-linked: DiscordLinkSettings {
             link-phase: root.link-phase; link-code: root.link-code; link-name: root.link-name; link-note: root.link-note;
@@ -3160,6 +3234,27 @@ export component YapfastWindow inherits Window {
         clear-status => { root.clear-status(); }
         close-status => { root.close-status(); }
     }
+    // Making a poll; see PollDialog.
+    if root.poll-open: PollDialog {
+        question <=> root.poll-question; question-count: root.poll-question-count;
+        answers: root.poll-answers; duration: root.poll-duration; multiselect: root.poll-multiselect;
+        can-add: root.poll-can-add; can-post: root.poll-can-post; posting: root.poll-posting;
+        problem: root.poll-problem; emoji-font: root.emoji-font;
+        question-edited(text) => { root.poll-question-edited(text); }
+        answer-edited(index, text) => { root.poll-answer-edited(index, text); }
+        pick-emoji(index, x, y, width, height) => {
+            root.poll-emoji-answer = index;
+            root.anchor(x, y, width, height, true);
+            root.open-picker("yapfast:poll");
+        }
+        remove-emoji(index) => { root.poll-answer-emoji(index, ""); }
+        add-answer => { root.poll-add-answer(); }
+        remove-answer(index) => { root.poll-remove-answer(index); }
+        choose-duration(index) => { root.poll-duration-chosen(index); }
+        set-multiselect(on) => { root.poll-multiselect-set(on); }
+        post => { root.post-poll(); }
+        close => { root.close-poll(); }
+    }
     // Starting a DM; see NewDmDialog.
     if root.new-dm-open: NewDmDialog {
         new-dm-query <=> root.new-dm-query; matrix: root.matrix-build;
@@ -3173,7 +3268,7 @@ export component YapfastWindow inherits Window {
         reaction-pills: root.reaction-pills; reactions-key: root.reactions-key;
         reactor-rows: root.reactor-rows; reactors-loading: root.reactors-loading;
         reactors-more: root.reactors-more; reactors-error: root.reactors-error;
-        emoji-font: root.emoji-font;
+        voters: root.reactions-voters; emoji-font: root.emoji-font;
         select-reaction(key) => { root.select-reaction(key); }
         more-reactors => { root.more-reactors(); }
         remove-reactor(id) => { root.remove-reactor(id); }

@@ -131,13 +131,15 @@ test it on.
 - Threads: start one from a message, browse a channel's threads, join or leave
   one, and read it beside its channel.
 - Forums: browse the posts as cards, with their tags, first message, top
-  reaction and thumbnail, search them, and read one beside the forum.
+  reaction and thumbnail, search them, post in them, and read one beside the
+  forum.
 - Search a whole server with Discord's filters, and browse a channel's pins.
 - The GIF picker, my favorite part :p Your favorites live on disk as 40 KB
   clips, so they're there the moment it opens, and you're done sitting there
   cringing while the GOATed GIF loads.
 - Voice channels and DM calls, with mute, deafen, a volume for each person,
-  noise suppression, echo removal, and a voice gate you can tune. Go Live, watch
+  noise suppression, echo removal, and a voice gate you can tune, or
+  push-to-talk on any key you like, held in any app. Go Live, watch
   other people's streams and turn on your camera. The call stays up while you
   read other channels.
 - Friends: requests, adding by username, nicknames, notes, profile cards, your
@@ -163,9 +165,9 @@ test it on.
 
 ### Not there yet
 
-- Posting in forums, and media channels.
-- Push-to-talk and the soundboard.
-- Polls, activities and server settings.
+- Media channels.
+- The soundboard.
+- Activities and server settings.
 - Making and changing server folders, and joining a server by invite.
 - A list of the people you blocked.
 - Leaving a group DM.
@@ -210,7 +212,7 @@ memory before you've opened a single channel. Yapfast draws with Slint, on the
 processor by default (WAY lighter) or the GPU if you ask. It also does Matrix
 (from source, for now), DeepFilterNet noise suppression on top of RNNoise,
 voice gates, and the cached GIF picker. It's still missing a few things, like
-posting in forums, polls and push-to-talk.
+media channels and the soundboard.
 
 **Did you use AI to write it?** Yep. Opus 5.5 wrote most of the code, and 6.1
 Sol and 6 Astra did adversarial review and helped with the nastiest bugs

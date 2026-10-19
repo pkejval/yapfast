@@ -2,22 +2,23 @@
 //! and settings, kept current from dispatched events.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
 };
 
 use serde_json::Value;
 
 use super::{
-    Account, Conversation, DO_NOT_DISTURB, Friend, FriendRequest, Live, Snapshot, Status,
+    Account, Conversation, DO_NOT_DISTURB, Friend, FriendRequest, Live, Preview, Snapshot, Status,
     VoiceMember, VoiceServer,
     marks::{Marks, Published},
     now_ms, server,
 };
 use crate::{
+    activity::{self, Activities},
     event::Event,
     member_list::{self, ListedMember, Presence},
-    message::Names,
+    message::{Message, Names},
     ready::{self, PRIVATE, Private, Server},
     settings::{self, CustomStatus},
     stream::{self, StreamServer},
@@ -30,6 +31,15 @@ const FRIEND: u64 = 1;
 const BLOCKED: u64 = 2;
 const INCOMING_REQUEST: u64 = 3;
 const OUTGOING_REQUEST: u64 = 4;
+
+/// What Discord says of a friend or a DM's person.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct Known {
+    presence: Presence,
+    /// Their custom status, else what they're doing, on one line.
+    activity: Option<String>,
+    activities: Activities,
+}
 
 struct VoiceEntry {
     channel: String,
@@ -68,8 +78,9 @@ pub(super) struct Tracker {
     pub(super) unreads: Unreads,
     /// DMs and group DMs.
     private: Vec<Private>,
-    /// What friends are doing, for group DM member lists.
-    presences: HashMap<String, (Presence, Option<String>)>,
+    /// What friends and DM people are doing: whether they're around, the
+    /// line under their name, and their activities in full.
+    presences: HashMap<String, Known>,
     /// The account's friends, by user id.
     friends: Vec<String>,
     /// Those this account blocked, by user id.
@@ -90,6 +101,10 @@ pub(super) struct Tracker {
     /// Friend requests by user id: whether each came to this account, whether
     /// Discord took it for spam, and when it was sent.
     requests: HashMap<String, (bool, bool, String)>,
+    /// Each message request's latest message, by channel id, and the
+    /// requests whose message was asked of Discord.
+    previews: HashMap<String, Preview>,
+    previews_asked: HashSet<String>,
     /// The RTC server of each stream this account shares or watches, by key.
     streams: HashMap<String, String>,
     /// The channel or thread on screen, and a thread beside it, each of
@@ -131,6 +146,8 @@ impl Tracker {
             custom_status: None,
             afk_timeout: settings::AFK_TIMEOUT,
             requests: HashMap::new(),
+            previews: HashMap::new(),
+            previews_asked: HashSet::new(),
             streams: HashMap::new(),
             viewing: None,
             beside: None,
@@ -813,15 +830,93 @@ impl Tracker {
         self.private.push(private);
     }
 
+    /// Message requests whose latest message is neither known nor asked
+    /// for, which count as asked for now. Previews of what's no longer a
+    /// request go.
+    pub(super) fn previews_wanted(&mut self) -> Vec<String> {
+        let requests: HashSet<&str> = self
+            .private
+            .iter()
+            .filter(|private| private.request)
+            .map(|private| private.id.as_str())
+            .collect();
+        self.previews.retain(|id, _| requests.contains(id.as_str()));
+        let wanted: Vec<String> = requests
+            .into_iter()
+            .filter(|id| !self.previews.contains_key(*id) && !self.previews_asked.contains(*id))
+            .map(str::to_owned)
+            .collect();
+        self.previews_asked.extend(wanted.iter().cloned());
+        wanted
+    }
+
+    /// Takes in Discord's supplemental data for message requests,
+    /// `[{channel_id, message_preview}]`; returns whether a preview changed.
+    pub(super) fn put_previews(&mut self, found: &Value) -> bool {
+        let mut changed = false;
+        for entry in found.as_array().into_iter().flatten() {
+            if let Some(message) = crate::message::parse(&entry["message_preview"]) {
+                changed |= self.preview(&message);
+            }
+        }
+        changed
+    }
+
+    /// Keeps a message in a message request as its preview, unless a newer
+    /// one is; returns whether the preview changed.
+    pub(super) fn preview(&mut self, message: &Message) -> bool {
+        let channel = &message.channel_id;
+        if !self
+            .private
+            .iter()
+            .any(|private| private.id == *channel && private.request)
+        {
+            return false;
+        }
+        if self
+            .previews
+            .get(channel)
+            .is_some_and(|known| known.id.parse::<u64>().ok() > message.id.parse().ok())
+        {
+            return false;
+        }
+        let text = self
+            .names
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .render(None, &message.content);
+        let preview = Preview {
+            id: message.id.clone(),
+            text,
+            files: message.attachments.len(),
+        };
+        self.previews.insert(channel.clone(), preview.clone()) != Some(preview)
+    }
+
+    /// A message request's preview was deleted: it's asked for again.
+    pub(super) fn unpreview(&mut self, channel: &str, id: &str) -> bool {
+        if !self
+            .previews
+            .get(channel)
+            .is_some_and(|known| known.id == id)
+        {
+            return false;
+        }
+        self.previews.remove(channel);
+        self.previews_asked.remove(channel);
+        true
+    }
+
     /// Learns a friend's presence; returns whether it changed.
     fn presence(&mut self, user: Option<&str>, data: &Value) -> bool {
         let Some(user) = user else {
             return false;
         };
-        let presence = (
-            Presence::parse(data),
-            member_list::activity(&data["activities"]),
-        );
+        let presence = Known {
+            presence: Presence::parse(data),
+            activity: member_list::activity(&data["activities"]),
+            activities: activity::activities(&data["activities"]),
+        };
         self.presences.insert(user.to_owned(), presence.clone()) != Some(presence)
     }
 
@@ -839,8 +934,11 @@ impl Tracker {
         let heading = format!("Members — {}", group.recipients.len() + 1);
         let mut members: Vec<_> = people
             .map(|user| {
-                let (presence, activity) = if *user == self.me {
-                    (Presence::Online, None)
+                let known = if *user == self.me {
+                    Known {
+                        presence: Presence::Online,
+                        ..Known::default()
+                    }
                 } else {
                     self.presences.get(user).cloned().unwrap_or_default()
                 };
@@ -850,9 +948,10 @@ impl Tracker {
                     username: names.username(user).map(str::to_owned),
                     avatar: names.avatar(None, user),
                     group: heading.clone(),
-                    presence,
+                    presence: known.presence,
                     color: None,
-                    activity,
+                    activity: known.activity,
+                    activities: known.activities,
                     roles: Arc::default(),
                     timed_out_until: None,
                 }
@@ -1085,8 +1184,11 @@ impl Tracker {
                     }),
                     nickname,
                     avatar: names.avatar(None, user),
-                    presence: known.map(|(presence, _)| *presence),
-                    activity: known.and_then(|(_, activity)| activity.clone()),
+                    presence: known.map(|known| known.presence),
+                    activity: known.and_then(|known| known.activity.clone()),
+                    activities: known
+                        .map(|known| known.activities.clone())
+                        .unwrap_or_default(),
                 }
             })
             .collect();
@@ -1149,6 +1251,10 @@ impl Tracker {
                         elsewhere: false,
                     })
                     .collect();
+                let preview = private
+                    .request
+                    .then(|| self.previews.get(&private.id).cloned())
+                    .flatten();
                 Conversation {
                     id: private.id,
                     name: title,
@@ -1166,8 +1272,12 @@ impl Tracker {
                     muted: private.muted,
                     call,
                     ringing,
-                    presence: known.map(|(presence, _)| *presence),
-                    activity: known.and_then(|(_, activity)| activity.clone()),
+                    presence: known.map(|known| known.presence),
+                    activity: known.and_then(|known| known.activity.clone()),
+                    activities: known
+                        .map(|known| known.activities.clone())
+                        .unwrap_or_default(),
+                    preview,
                 }
             })
             .collect()
@@ -2048,6 +2158,44 @@ mod tests {
             "requests count no mentions, and spam isn't unread"
         );
 
+        // Each request is asked for its message once, and shows the newest
+        // it knows; a deleted one is asked for again.
+        let mut wanted = tracker.previews_wanted();
+        wanted.sort();
+        assert_eq!(wanted, ["20", "21"]);
+        assert!(tracker.previews_wanted().is_empty());
+        let message = |id: &str, content: &str| {
+            crate::message::parse(&json!({
+                "id": id, "channel_id": "20", "content": content,
+                "author": {"id": "2", "username": "ann"},
+            }))
+            .unwrap()
+        };
+        assert!(tracker.preview(&message("502", "Later")));
+        assert!(
+            tracker.put_previews(&json!([{"channel_id": "20", "message_preview": {
+                "id": "503", "channel_id": "20", "content": "Latest", "author": {"id": "2"},
+            }}]))
+        );
+        assert!(
+            !tracker.preview(&message("500", "Hello")),
+            "an older message stays out"
+        );
+        let previewed = |tracker: &mut Tracker| {
+            let snapshot = tracker.snapshot();
+            let dm = snapshot
+                .conversations
+                .iter()
+                .find(|dm| dm.id == "20")
+                .unwrap();
+            dm.preview.as_ref().map(|preview| preview.text.clone())
+        };
+        assert_eq!(previewed(&mut tracker).as_deref(), Some("Latest"));
+        assert!(tracker.unpreview("20", "503"));
+        assert_eq!(previewed(&mut tracker), None);
+        assert_eq!(tracker.previews_wanted(), ["20"]);
+        assert!(tracker.preview(&message("504", "Again")));
+
         // Accepting makes it a DM; ignoring removes it.
         tracker.apply(
             &Event::ChannelUpdate,
@@ -2058,6 +2206,12 @@ mod tests {
         assert_eq!(snapshot.conversations.len(), 1);
         assert!(!snapshot.conversations[0].request);
         assert_eq!(snapshot.conversations[0].mentions, 1);
+        assert_eq!(
+            snapshot.conversations[0].preview, None,
+            "a DM shows no request's message"
+        );
+        assert!(tracker.previews_wanted().is_empty());
+        assert!(!tracker.preview(&message("505", "Hi")));
     }
 
     #[test]
@@ -2405,5 +2559,33 @@ mod tests {
         assert_eq!(renamed.servers[0].name, "Renamed");
         assert_eq!(unread.servers[0].name, "One");
         assert!(Arc::ptr_eq(&unread.servers[1], &renamed.servers[1]));
+    }
+
+    #[test]
+    fn a_voice_channels_chat_is_unread_as_a_text_channel_is() {
+        let ready = json!({
+            "user": {"id": "1"},
+            "guilds": [{"id": "10", "properties": {"name": "One"},
+                "channels": [{"id": "11", "name": "Lounge", "type": 2, "position": 0,
+                              "last_message_id": "800"}]}],
+            "read_state": {"entries": [{"id": "11", "last_message_id": "700", "mention_count": 1}]},
+        });
+        let mut tracker = Tracker::from_ready("1".into(), &ready, Default::default());
+        let marks = |tracker: &mut Tracker| {
+            let voice = &tracker.snapshot().servers[0].voice_channels[0];
+            (voice.unread, voice.mentions, voice.last_read)
+        };
+        assert_eq!(marks(&mut tracker), (true, 1, 700));
+        tracker.apply(
+            &Event::MessageCreate,
+            &json!({"id": "900", "channel_id": "11", "guild_id": "10",
+                    "author": {"id": "2"}, "mentions": [{"id": "1"}]}),
+        );
+        assert_eq!(marks(&mut tracker), (true, 2, 700));
+        tracker.apply(
+            &Event::MessageAck,
+            &json!({"channel_id": "11", "message_id": "900", "mention_count": 0}),
+        );
+        assert_eq!(marks(&mut tracker), (false, 0, 900));
     }
 }
