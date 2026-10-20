@@ -30,7 +30,7 @@ flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/fl
 flatpak-builder --user --force-clean --install-deps-from=flathub \
   --repo="$work/repo" "$work/build" packaging/flatpak/io.github.yapfast.Yapfast.yml
 # Without the runtime's repository a bundle installs only where the runtime
-# is already installed: "runtime org.freedesktop.Platform/24.08 not installed".
+# is already installed: "runtime org.freedesktop.Platform/26.08 not installed".
 flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
   "$work/repo" "$bundle" io.github.yapfast.Yapfast
 echo "Packaged $bundle ($(du -m "$bundle" | cut -f1) MiB)"
