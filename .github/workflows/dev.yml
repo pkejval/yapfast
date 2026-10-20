@@ -72,10 +72,14 @@ jobs:
           # The same for the C and C++ the crates compile (__FILE__, assertions).
           export CFLAGS="-ffile-prefix-map=$HOME=/home/build -ffile-prefix-map=$PWD=/build/src"
           export CXXFLAGS="$CFLAGS"
+          # nix develop's $out is $PWD/outputs/out, and the linker wrapper
+          # writes its lib folder into the binary's RUNPATH.
+          export NIX_DONT_SET_RPATH=1 NIX_DONT_SET_RPATH_FOR_BUILD=1
           nix develop path:./nix --command cargo build --profile dev-ci --locked \
             --no-default-features --features desktop,discord
           # Where the runner's home is still named, if anywhere.
           grep -a -o "[ -~]*$HOME[ -~]*" target/dev-ci/yapfast | sort | uniq -c | sort -rn | head -40 || true
+          nix develop path:./nix --command readelf -d target/dev-ci/yapfast | grep -i -E 'rpath|runpath' || true
       # A lower compression than the releases': this AppImage is for testing.
       - run: scripts/build-appimage --binary target/dev-ci/yapfast --zstd-level 3
       - name: Install Flatpak
