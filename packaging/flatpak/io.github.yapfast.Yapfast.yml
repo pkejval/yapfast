@@ -1,0 +1,31 @@
+# Flatpak of the AppImage's binary and files; scripts/build-flatpak runs it with the AppImage
+# extracted into target/flatpak/squashfs-root. The binary runs on the runtime's loader and
+# libraries, as nix/appimage.nix makes it run on a distribution's.
+app-id: io.github.yapfast.Yapfast
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+command: yapfast
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --device=dri
+  # The tray icon and notifications.
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --own-name=org.kde.*
+  - --talk-name=org.freedesktop.Notifications
+  # Rich Presence from games, over Discord's IPC socket.
+  - --filesystem=xdg-run/discord-ipc-0
+  - --filesystem=xdg-run/discord-ipc-1
+modules:
+  - name: yapfast
+    buildsystem: simple
+    build-commands:
+      - cp -r usr/. /app/
+      - chmod -R u+w,a+rX /app
+    sources:
+      - type: dir
+        path: ../../target/flatpak/squashfs-root

@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Rebuilds the fork's `dev` branch: the current upstream main with every local
+# pr/* and local/* branch merged into it, so they build together while each
+# pr/* branch stays a clean series for its own upstream PR.
+#   pr/*     one feature or fix for upstream, one branch from upstream/main
+#   local/*  changes that stay in the fork (CI, packaging, this script)
+# Each branch is first rebased onto upstream/main; one that has nothing left
+# (upstream merged it) is reported, to delete. A rebase that conflicts stops
+# the script, to resolve by hand. `--push` then sends the branches, dev and
+# origin/main with --force-with-lease; without it nothing leaves this machine.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+push=
+[[ ${1:-} == --push ]] && push=1
+if [[ -n $(git status --porcelain --untracked-files=no) ]]; then
+  echo "scripts/rebuild-dev: commit or stash your changes first" >&2
+  exit 2
+fi
+git remote get-url upstream >/dev/null 2>&1 \
+  || git remote add upstream https://github.com/yapfast/yapfast.git
+git fetch --quiet upstream origin
+start=$(git branch --show-current)
+
+branches=()
+for branch in $(git for-each-ref --format='%(refname:short)' refs/heads/pr refs/heads/local); do
+  git checkout --quiet "$branch"
+  if ! git rebase --quiet upstream/main; then
+    echo "scripts/rebuild-dev: $branch conflicts with upstream/main; resolve it, git rebase --continue, rerun" >&2
+    exit 1
+  fi
+  if [[ $(git rev-list --count upstream/main.."$branch") -eq 0 ]]; then
+    echo "$branch has nothing upstream lacks: delete it"
+    continue
+  fi
+  branches+=("$branch")
+done
+
+git checkout --quiet -B dev upstream/main
+for branch in "${branches[@]}"; do
+  if ! git merge --quiet --no-ff -m "Merge $branch into dev" "$branch"; then
+    echo "scripts/rebuild-dev: $branch conflicts with the branches before it in dev" >&2
+    echo "resolve it, commit, and the result stays; rerere remembers it for the next run" >&2
+    exit 1
+  fi
+  echo "dev <- $branch"
+done
+git checkout --quiet "$start" 2>/dev/null || true
+if [[ -n $push ]]; then
+  git push --force-with-lease origin upstream/main:refs/heads/main dev "${branches[@]}"
+else
+  echo "built dev; run again with --push to send it"
+fi
