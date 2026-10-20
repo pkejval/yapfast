@@ -188,28 +188,10 @@ mod linux {
 
     impl Tray {
         pub fn start(chosen: fn(Choice)) -> Option<Self> {
-            let icons = |style, unread, speaking| {
-                SIZES
-                    .iter()
-                    .filter_map(|&size| super::logo(size, unread, speaking, style))
-                    .map(|pixels| ksni::Icon {
-                        width: pixels.width() as i32,
-                        height: pixels.height() as i32,
-                        // ARGB, in network byte order.
-                        data: pixels
-                            .as_slice()
-                            .iter()
-                            .flat_map(|pixel| [pixel.a, pixel.r, pixel.g, pixel.b])
-                            .collect(),
-                    })
-                    .collect()
-            };
             let online = Arc::new(AtomicBool::new(false));
             let item = Item {
                 shown: Shown::default(),
-                icons: std::array::from_fn(|index| {
-                    icons((index / 4) as u8, index & 1 != 0, index & 2 != 0)
-                }),
+                icons: Default::default(),
                 chosen,
                 online: online.clone(),
             };
@@ -261,10 +243,29 @@ mod linux {
 
     struct Item {
         shown: Shown,
-        /// The icon without the unread dot, and with it.
-        icons: [Vec<ksni::Icon>; 12],
+        /// Each palette without and with the unread dot, then the same with
+        /// the speaking mark; drawn when first shown.
+        icons: [std::cell::OnceCell<Vec<ksni::Icon>>; 12],
         chosen: fn(Choice),
         online: Arc<AtomicBool>,
+    }
+
+    /// The logo at each of the tray's sizes.
+    fn icons(style: u8, unread: bool, speaking: bool) -> Vec<ksni::Icon> {
+        SIZES
+            .iter()
+            .filter_map(|&size| super::logo(size, unread, speaking, style))
+            .map(|pixels| ksni::Icon {
+                width: pixels.width() as i32,
+                height: pixels.height() as i32,
+                // ARGB, in network byte order.
+                data: pixels
+                    .as_slice()
+                    .iter()
+                    .flat_map(|pixel| [pixel.a, pixel.r, pixel.g, pixel.b])
+                    .collect(),
+            })
+            .collect()
     }
 
     fn choose(chosen: fn(Choice), choice: Choice) {
@@ -300,9 +301,11 @@ mod linux {
                         .collect(),
                 }];
             }
-            self.icons[(self.shown.icon_style.min(2) as usize * 4)
+            let index = (self.shown.icon_style.min(2) as usize * 4)
                 | usize::from(self.shown.unread)
-                | (usize::from(self.shown.speaking) << 1)]
+                | (usize::from(self.shown.speaking) << 1);
+            self.icons[index]
+                .get_or_init(|| icons((index / 4) as u8, index & 1 != 0, index & 2 != 0))
                 .clone()
         }
 
