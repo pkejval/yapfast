@@ -530,6 +530,13 @@ make the same file, and the release carries one. A prerelease is never
 releases, and takes a nightly AppImage to the latest stable release, not the
 next nightly.
 
+The fork's `dev` branch builds differently, for repeat speed
+(`.github/workflows/dev.yml`): Nix supplies only the environment, and cargo
+compiles outside its sandbox with `Swatinem/rust-cache` and mold, in the
+`dev-ci` profile, which leaves the Slint interface unoptimized.
+`scripts/build-appimage --binary` packs that binary, with a lower compression
+than the releases'. Don't measure it.
+
 ## The app icon
 
 `packaging/icon.svg` is Yapfast's icon: the logo in marigold, its dots in

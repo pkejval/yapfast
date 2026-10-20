@@ -1,6 +1,11 @@
 # Builds the fork's `dev` branch, upstream main with the open feature branches
 # merged (scripts/rebuild-dev), as an AppImage and a Flatpak bundle, and
 # publishes them as the rolling prerelease `dev-latest`.
+#
+# Built for repeat speed: Nix supplies only the environment (its store is
+# cached), and cargo compiles outside Nix's sandbox, where the compiled
+# dependencies in target/ are cached, so a push compiles only what it changed.
+# The releases still build in the sandbox (nightly.yml).
 name: Dev build
 
 on:
@@ -33,6 +38,23 @@ jobs:
       - uses: cachix/install-nix-action@v31
         with:
           github_access_token: ${{ github.token }}
+      # The shell's toolchain, clang, Skia and WebRTC, and the packing tools.
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'nix/**') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 6G
+      # rustup's download of the pinned toolchain.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.rustup
+          key: rustup-${{ hashFiles('rust-toolchain.toml') }}
+      # The compiled dependencies, before scripts/set-version changes
+      # Cargo.lock, so a new version doesn't recompile them. A changed
+      # Cargo.lock restores the nearest older cache and compiles the difference.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - id: version
         run: |
           current=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
@@ -41,9 +63,23 @@ jobs:
       - run: scripts/set-version "${{ steps.version.outputs.version }}"
       - name: Fetch the toolchain and crates
         run: nix develop path:./nix --command cargo fetch --locked
-      - run: scripts/build-appimage
+      # Paths remapped, as in Nix's sandbox: the binary may not name the
+      # runner's home, which scripts/package-linux.py checks. mold links the
+      # large binary faster than the default linker.
+      - name: Build
+        run: |
+          export RUSTFLAGS="--remap-path-prefix=$HOME=/home/build --remap-path-prefix=$PWD=/build/src -C link-arg=-fuse-ld=mold"
+          nix develop path:./nix --command cargo build --profile dev-ci --locked \
+            --no-default-features --features desktop,discord
+      # A lower compression than the releases': this AppImage is for testing.
+      - run: scripts/build-appimage --binary target/dev-ci/yapfast --zstd-level 3
       - name: Install Flatpak
         run: sudo apt-get install -y flatpak flatpak-builder
+      # Flathub's runtime and SDK, which scripts/build-flatpak installs.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.local/share/flatpak
+          key: flatpak-${{ hashFiles('packaging/flatpak/*.yml') }}
       - run: scripts/build-flatpak
       - name: Smoke-test the Flatpak
         run: |
