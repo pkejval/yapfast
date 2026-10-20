@@ -2,6 +2,7 @@
 source snapshot each release carries, and the dependencies' licenses and
 notices each package holds."""
 import hashlib
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -56,6 +57,11 @@ def source_snapshot(metadata, base, temporary, destination):
         rtc_root = Path(rtc["manifest_path"]).parent.parent.parent
         shutil.copytree(rtc_root, source / "upstream/matrix-rust-rtc",
                         ignore=shutil.ignore_patterns(".git", "target", "node_modules"))
+    # Every file takes the commit's time, so two builds of one commit, such as
+    # a nightly's Linux and Windows jobs, zip the same snapshot.
+    committed = int(subprocess.check_output(["git", "log", "-1", "--format=%ct"], cwd=ROOT, timeout=30))
+    for path in source.rglob("*"):
+        os.utime(path, (committed, committed), follow_symlinks=False)
     zip_directory(source, destination)
     return rtc is not None
 
@@ -96,4 +102,9 @@ def dependency_notices(metadata, package, licenses, skia_archive, skia_source, w
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(notice, destination)
     shutil.copy2(webrtc / "LICENSE.md", licenses / "libwebrtc-LICENSE.md")
+    # Some crates ship a license only their owner may read (fnv's are 0600),
+    # and the AppImage's files all belong to root.
+    for path in licenses.rglob("*"):
+        if path.is_file():
+            path.chmod(0o644)
     return dependencies
