@@ -3,7 +3,7 @@
 # libraries, as nix/appimage.nix makes it run on a distribution's.
 app-id: io.github.yapfast.Yapfast
 runtime: org.freedesktop.Platform
-runtime-version: '24.08'
+runtime-version: '26.08'
 sdk: org.freedesktop.Sdk
 command: yapfast
 finish-args:
