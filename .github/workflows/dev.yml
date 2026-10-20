@@ -28,9 +28,14 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      # The runner's preinstalled SDKs leave too little room for the build.
-      - name: Free disk space
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      # Two slow chores run beside the steps that follow, which don't need
+      # them: the runner's preinstalled SDKs leave too little room for the
+      # build (deleting them took 90 s in a step of its own), and the Flatpak
+      # tools are for the last steps. The last steps wait for the second.
+      - name: Free disk space and install Flatpak in the background
+        run: |
+          nohup sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL >/dev/null 2>&1 &
+          nohup sh -c 'sudo apt-get install -y flatpak flatpak-builder >/tmp/apt.log 2>&1; touch /tmp/apt-done' >/dev/null 2>&1 &
       - uses: actions/checkout@v5
         with:
           # Nix refuses a shallow Git repository as a flake.
@@ -38,13 +43,9 @@ jobs:
       - uses: cachix/install-nix-action@v31
         with:
           github_access_token: ${{ github.token }}
-      # The shell's toolchain, clang, Skia and WebRTC, and the packing tools.
-      - uses: nix-community/cache-nix-action@v6
-        with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'nix/**') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
-          gc-max-store-size-linux: 6G
-      # rustup's download of the pinned toolchain.
+      # No cache of Nix's store: the shell downloads in under a minute from
+      # cache.nixos.org, which a restore (and the save after it) takes as long
+      # as. rustup's download of the pinned toolchain is cached.
       - uses: actions/cache@v4
         with:
           path: ~/.rustup
@@ -52,9 +53,13 @@ jobs:
       # The compiled dependencies, before scripts/set-version changes
       # Cargo.lock, so a new version doesn't recompile them. A changed
       # Cargo.lock restores the nearest older cache and compiles the difference.
+      # A cache is saved once per key, so the key also names what the C and
+      # C++ dependencies were compiled with, or an old cache would stay
+      # in use, and its dependencies recompile on every run.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          key: ${{ hashFiles('.github/workflows/dev.yml', 'nix/flake.nix', 'nix/flake.lock', 'nix/native.nix') }}
       - id: version
         run: |
           current=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
@@ -83,8 +88,10 @@ jobs:
           grep -a -o "[ -~]*$HOME[ -~]*" target/dev-ci/yapfast | sort | uniq -c | sort -rn | head -40 || true
       # A lower compression than the releases': this AppImage is for testing.
       - run: scripts/build-appimage --binary target/dev-ci/yapfast --zstd-level 3
-      - name: Install Flatpak
-        run: sudo apt-get install -y flatpak flatpak-builder
+      - name: Wait for the Flatpak tools
+        run: |
+          while [ ! -e /tmp/apt-done ]; do sleep 1; done
+          command -v flatpak-builder || { cat /tmp/apt.log; exit 1; }
       # Flathub's runtime and SDK, which scripts/build-flatpak installs.
       - uses: actions/cache@v4
         with:
