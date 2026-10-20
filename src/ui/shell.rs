@@ -216,26 +216,21 @@ impl Shell {
     /// Brings the window to the front, making it again if it was closed.
     pub(super) fn open(self: &Rc<Self>) -> Option<YapfastWindow> {
         if let Some(window) = self.window() {
-            let _ = window.show();
-            window.window().set_minimized(false);
-            window.window().with_winit_window(|winit| {
-                winit.focus_window();
-                #[cfg(target_os = "linux")]
-                {
-                    use slint::winit_030::winit::{
-                        raw_window_handle::{HasDisplayHandle, RawDisplayHandle},
-                        window::UserAttentionType,
-                    };
-                    // On Wayland focus_window is a no-op; winit requests
-                    // xdg_activation through request_user_attention instead.
-                    if winit.display_handle().is_ok_and(|display| {
-                        matches!(display.as_raw(), RawDisplayHandle::Wayland(_))
-                    }) {
-                        winit.request_user_attention(Some(UserAttentionType::Informational));
-                    }
-                }
-            });
-            return Some(window);
+            // Wayland has no way to raise a window: winit's focus_window does
+            // nothing, and an activation request needs a token from the user's
+            // last input in this app, which a click on the tray isn't. A new
+            // window the compositor does show in front, in every desktop, so
+            // make it again as the closed one is.
+            if FOCUSED.get() || !on_wayland(&window) {
+                let _ = window.show();
+                window.window().set_minimized(false);
+                window
+                    .window()
+                    .with_winit_window(|winit| winit.focus_window());
+                return Some(window);
+            }
+            drop(window);
+            self.drop_window();
         }
         match self.make() {
             Ok(window) => Some(window),
@@ -435,4 +430,26 @@ pub(super) fn release_memory() {
         }
     }
     tracing::info!("memory released");
+}
+
+/// Whether the window is on a Wayland compositor.
+fn on_wayland(window: &YapfastWindow) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use slint::winit_030::WinitWindowAccessor;
+        use slint::winit_030::winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+        window
+            .window()
+            .with_winit_window(|winit| {
+                winit
+                    .display_handle()
+                    .is_ok_and(|display| matches!(display.as_raw(), RawDisplayHandle::Wayland(_)))
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = window;
+        false
+    }
 }
