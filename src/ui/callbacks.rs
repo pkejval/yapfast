@@ -2472,11 +2472,7 @@ fn reset_tray_icon(adapter: &Rc<RefCell<Adapter>>, window: &YapfastWindow, speak
 fn refresh_icon_previews(adapter: &Adapter, window: &YapfastWindow) {
     let style = adapter.layout.icon_style.unwrap_or(0).clamp(0, 2) as u8;
     let app = adapter.custom_icon.as_deref().map(Vec::as_slice);
-    let idle = adapter
-        .tray_idle_icon
-        .as_deref()
-        .map(Vec::as_slice)
-        .or(app);
+    let idle = adapter.tray_idle_icon.as_deref().map(Vec::as_slice).or(app);
     let speaking = adapter
         .tray_speaking_icon
         .as_deref()

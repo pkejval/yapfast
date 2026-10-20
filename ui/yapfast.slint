@@ -884,6 +884,12 @@ export component YapfastWindow inherits Window {
     in property <bool> autostart-available;
     callback restart();
     callback preferences-changed();
+    callback choose-custom-icon();
+    callback reset-custom-icon();
+    callback choose-tray-idle-icon();
+    callback reset-tray-idle-icon();
+    callback choose-tray-speaking-icon();
+    callback reset-tray-speaking-icon();
     /// The built-in themes, and the one shown by its id; choose-theme shows
     /// and keeps another.
     in property <[ThemeCard]> themes;

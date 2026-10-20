@@ -2547,12 +2547,25 @@ impl Adapter {
         let account = state.account.as_deref().unwrap_or("Preview");
         window.set_voice_active(voice.active());
         // The account panel's picture rings as the account's own row in the call does.
-        window.set_account_speaking(
-            voice.active()
-                && voice.participants.iter().any(|person| {
-                    person.local && person.speaking && !person.muted && person.connected
+        let local_speaking = voice.active()
+            && voice
+                .participants
+                .iter()
+                .any(|person| person.local && person.speaking && !person.muted && person.connected);
+        window.set_account_speaking(local_speaking);
+        if let Some(tray) = &self.tray {
+            tray.show(crate::tray::Shown {
+                unread: state.rooms.iter().any(|room| {
+                    room.mentions > 0 || (room.direct && !room.muted && room.unread > 0)
                 }),
-        );
+                call: voice.active(),
+                speaking: local_speaking && self.layout.tray_voice_activity.unwrap_or(true),
+                icon_style: self.layout.icon_style.unwrap_or(0).clamp(0, 2) as u8,
+                custom_icon: self.custom_icon.clone(),
+                idle_icon: self.tray_idle_icon.clone(),
+                speaking_icon: self.tray_speaking_icon.clone(),
+            });
+        }
         window.set_voice_visible(voice.active() || voice.error.is_some());
         window.set_voice_ready(matches!(
             voice.phase,

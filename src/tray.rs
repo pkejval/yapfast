@@ -126,10 +126,8 @@ pub fn preview(style: u8, speaking: bool, pixels: Option<&[u8]>) -> slint::Image
     let image = pixels
         .filter(|pixels| pixels.len() == 64 * 64 * 4)
         .map(|pixels| custom_with_status(pixels, false, speaking))
-        .and_then(|pixels| {
-            Some(slint::Image::from_rgba8(
-                slint::SharedPixelBuffer::clone_from_slice(&pixels, 64, 64),
-            ))
+        .map(|pixels| {
+            slint::Image::from_rgba8(slint::SharedPixelBuffer::clone_from_slice(&pixels, 64, 64))
         })
         .or_else(|| logo(64, false, speaking, style).map(slint::Image::from_rgba8));
     image.unwrap_or_default()
