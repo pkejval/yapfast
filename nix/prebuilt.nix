@@ -9,6 +9,8 @@ in
 pkgs.runCommand "yapfast-prebuilt-${version}" { inherit version; } ''
   install -Dm755 ${binary} "$out/bin/.yapfast-wrapped"
   install -Dm644 ${../packaging/icon.svg} "$out/share/icons/hicolor/scalable/apps/${id}.svg"
-  install -Dm644 ${../packaging/linux/${id}.desktop} -t "$out/share/applications"
-  install -Dm644 ${../packaging/linux/${id}.metainfo.xml} -t "$out/share/metainfo"
+  # Named in full: a file in the store carries a hash prefix, which Flatpak
+  # won't export and the AppImage's links don't follow.
+  install -Dm644 ${../packaging/linux/${id}.desktop} "$out/share/applications/${id}.desktop"
+  install -Dm644 ${../packaging/linux/${id}.metainfo.xml} "$out/share/metainfo/${id}.metainfo.xml"
 ''
