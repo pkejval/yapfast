@@ -149,7 +149,14 @@
 // category leaves its channels outside any, as Discord does. DELETE
 // /users/@me/guilds/{id} leaves "Server", owned by Bob, with GUILD_DELETE and
 // GUILD_MEMBER_REMOVE, and READY leaves it out until POST /_control/rejoin
-// brings her back with its GUILD_CREATE.
+// brings her back with its GUILD_CREATE. So does joining by an invite: GET
+// /invites/{code} resolves one Alice made, or "server", which lands in
+// "Server"'s #general as a vanity code would, and POST /invites/{code} joins
+// from her gateway session. GET /_control/invite-joins lists each join with
+// its X-Context-Properties and session. POST /_control/invite-captcha makes
+// the next join ask for an hCaptcha, as the QR ticket's does, and POST
+// /_control/invite-form makes it answer that the server has a form to fill
+// in first.
 // Linking by QR code goes through a remote login gateway at /remote-auth/, as
 // remote-auth-gateway.discord.gg speaks it. POST /_control/qr-scan scans the
 // code shown as Alice, /_control/qr-confirm confirms it, /_control/qr-cancel
@@ -455,10 +462,19 @@ function wireUser(user: User) {
 // served back from the CDN as it came; the avatar, banner and bio need
 // Nitro, as on Discord: `--nitro`, or POST /_control/nitro (see below).
 // GET /_control/server-profile shows hers.
+// Alice changes her main profile as Discord's profile editor does: her
+// display name and avatar with PATCH /users/@me, and her bio, pronouns,
+// banner and banner colour with PATCH /users/@me/profile, each answered
+// with USER_UPDATE. An empty display name goes by her username, and null
+// takes a picture or colour away. The banner needs Nitro, and an animated
+// avatar Nitro or Classic, here `--nitro`. GET /_control/profile shows hers,
+// and POST /_control/profile-reset puts it back as it started.
 const memberRoles = new Map<string, string[]>();
 const memberNicks = new Map<string, string>();
 /** Server profiles by user: avatar and banner hashes, bio and pronouns. */
 const serverProfiles = new Map<string, { avatar: string | null; banner: string | null; bio: string; pronouns: string }>();
+/** Alice's main profile, which PATCH /users/@me/profile changes. */
+const aliceProfile = { bio: "", pronouns: "", banner: null as string | null, accent_color: null as number | null };
 /** Pictures uploaded as avatars and banners, by hash, served from the CDN. */
 const uploadedPictures = new Map<string, { type: string; data: Uint8Array }>();
 function serverProfile(id: string) {
@@ -558,7 +574,7 @@ function wireProfile(user: User, guild: string | null) {
   const carol = user.id === users.carol.id;
   const inServer = Object.values(users).includes(user) && user.id !== ALICE;
   const isMember = Object.values(users).includes(user);
-  const profile = {
+  const profile = user.id === ALICE ? aliceProfile : {
     bio: bob ? "Plays bass in a **ska** band. Ask me about https://example.com/gigs" : "",
     pronouns: bob ? "he/him" : "",
     banner: bob ? "bob-banner" : null,
@@ -1701,6 +1717,21 @@ const deletedChannels = new Set<string>();
 // Whether Alice left "Server"; see DELETE /users/@me/guilds/{id}.
 let leftServer = false;
 
+/** Brings Alice back into "Server", with its GUILD_CREATE. */
+function rejoin() {
+  leftServer = false;
+  dispatch("GUILD_CREATE", {
+    ...guild(),
+    joined_at: new Date().toISOString(),
+    members: [member(users.alice)],
+    voice_states: [],
+    presences: [],
+    threads: [],
+    stage_instances: [],
+    guild_scheduled_events: [],
+  });
+}
+
 /** "Server"'s channels as they are now. */
 function guildChannels(): GuildChannel[] {
   const channel = guildChannel;
@@ -2144,6 +2175,10 @@ let logouts = 0;
 const tickets = new Map<string, CryptoKey>();
 /** Whether trading a ticket asks for a captcha first. */
 let ticketCaptcha = false;
+/** Whether joining by an invite asks for a captcha first, and answers that
+ *  the server has a verification form. */
+let inviteCaptcha = false;
+let inviteForm = false;
 const TICKET_CAPTCHA = {
   captcha_key: ["captcha-required"],
   captcha_service: "hcaptcha",
@@ -3414,6 +3449,8 @@ const notFound = (message = "404: Not Found", code = 0) => json({ message, code 
 
 /** The invites Alice made, oldest first, for GET /_control/invites. */
 const invites: Record<string, unknown>[] = [];
+/** Each join by an invite, oldest first, for GET /_control/invite-joins. */
+const inviteJoins: Record<string, unknown>[] = [];
 
 /** Files uploaded for a message that isn't sent yet, by uploaded filename. */
 const uploads = new Map<string, { filename: string; data?: Uint8Array }>();
@@ -4489,6 +4526,53 @@ async function api(req: Request, path: string, origin: string): Promise<Response
     return json(guilds.map(([guild, change]) => changeGuildSettings(guild, change)));
   }
 
+  // Alice's main profile: her display name and avatar, then her bio,
+  // pronouns, banner and banner colour; see "Server members" above.
+  if (method === "PATCH" && path === "/users/@me") {
+    const body: any = await req.json().catch(() => ({}));
+    const alice: any = users.alice;
+    if (typeof body.global_name === "string" && body.global_name.length > 32) return tooLong("global_name", 32);
+    if ("avatar" in body && body.avatar !== null) {
+      if (String(body.avatar).startsWith("data:image/gif") && !nitro) return premiumRequired("avatar");
+      const kept = keepPicture(body.avatar);
+      if ("error" in kept) return json({ message: "Invalid Form Body", code: 50035, errors: { avatar: { _errors: [{ code: "IMAGE_INVALID", message: kept.error }] } } }, 400);
+      alice.avatar = kept.hash;
+    } else if ("avatar" in body) {
+      alice.avatar = null;
+    }
+    if ("global_name" in body) alice.global_name = body.global_name || null;
+    const wire = { ...wireUser(users.alice), premium_type: nitro ? 2 : 0 };
+    dispatch("USER_UPDATE", wire);
+    return json(wire);
+  }
+  if (method === "PATCH" && path === "/users/@me/profile") {
+    const body: any = await req.json().catch(() => ({}));
+    if (typeof body.pronouns === "string" && body.pronouns.length > 40) return tooLong("pronouns", 40);
+    if (typeof body.bio === "string" && body.bio.length > 190) return tooLong("bio", 190);
+    if (body.banner && !nitro) return premiumRequired("banner");
+    if ("banner" in body) {
+      const kept = body.banner === null ? { hash: null } : keepPicture(body.banner);
+      if ("error" in kept) return json({ message: "Invalid Form Body", code: 50035, errors: { banner: { _errors: [{ code: "IMAGE_INVALID", message: kept.error }] } } }, 400);
+      aliceProfile.banner = kept.hash;
+    }
+    if ("accent_color" in body) {
+      const colour = body.accent_color;
+      if (colour !== null && !(Number.isInteger(colour) && colour >= 0 && colour <= 0xffffff)) {
+        return json({ message: "Invalid Form Body", code: 50035, errors: { accent_color: { _errors: [{ code: "NUMBER_TYPE_COERCE", message: "Value is not int." }] } } }, 400);
+      }
+      aliceProfile.accent_color = colour;
+    }
+    if (typeof body.pronouns === "string" || body.pronouns === null) aliceProfile.pronouns = body.pronouns ?? "";
+    if (typeof body.bio === "string" || body.bio === null) aliceProfile.bio = body.bio ?? "";
+    dispatch("USER_UPDATE", {
+      ...wireUser(users.alice),
+      banner: aliceProfile.banner,
+      accent_color: aliceProfile.accent_color,
+      premium_type: nitro ? 2 : 0,
+    });
+    return json(aliceProfile);
+  }
+
   // Alice's own profile in "Server": banner, bio and pronouns, as the
   // per-server profile editor sends them; see "Server members" above.
   if (method === "PATCH" && (m = path.match(/^\/guilds\/(\d+)\/profile\/@me$/))) {
@@ -4672,6 +4756,58 @@ async function api(req: Request, path: string, origin: string): Promise<Response
     const { guild: _, channel: wire, ...rest } = invite;
     dispatch("INVITE_CREATE", { ...rest, channel_id: wire.id, guild_id: server.id });
     return json(invite);
+  }
+
+  // Resolving an invite before joining by it, and joining. The invite is
+  // one Alice made, or "server" for "Server"'s #general. Joining "Server"
+  // after leaving it brings her back; joining a server she's in does
+  // nothing more, as on Discord, which answers that she isn't new.
+  const knownInvite = (code: string) => {
+    const made = invites.find((invite) => invite.code === code) as any;
+    if (made) {
+      const { location: _, ...invite } = made;
+      return invite;
+    }
+    if (code !== "server") return undefined;
+    const server = guild();
+    return {
+      type: 0,
+      code,
+      inviter: null,
+      expires_at: null,
+      guild: { id: GUILD, name: server.properties.name, icon: server.properties.icon, splash: null, banner: null, description: null, features: [], verification_level: 0, vanity_url_code: "server", nsfw_level: 0, premium_subscription_count: 0 },
+      guild_id: GUILD,
+      channel: { id: GENERAL, type: 0, name: "general" },
+    };
+  };
+  if ((m = path.match(/^\/invites\/([\w-]+)$/)) && (method === "GET" || method === "POST")) {
+    const invite = knownInvite(m[1]!);
+    if (!invite) return notFound("Unknown Invite", 10006);
+    if (method === "GET") {
+      return json({ ...invite, approximate_member_count: Object.keys(users).length, approximate_presence_count: 3 });
+    }
+    const body: any = await req.json().catch(() => ({}));
+    const live = [...sockets].some((ws) => ws.data.identified && ws.data.session === body.session_id);
+    if (!live) return json({ message: "Invalid Form Body", code: 50035 }, 400);
+    if (inviteCaptcha) {
+      const solved = req.headers.get("x-captcha-key") === "solved"
+        && req.headers.get("x-captcha-rqtoken") === TICKET_CAPTCHA.captcha_rqtoken
+        && req.headers.get("x-captcha-session-id") === TICKET_CAPTCHA.captcha_session_id;
+      if (!solved) return json(TICKET_CAPTCHA, 400);
+      inviteCaptcha = false;
+    }
+    let context: unknown;
+    try {
+      context = JSON.parse(atob(req.headers.get("x-context-properties") ?? ""));
+    } catch {
+      context = null;
+    }
+    inviteJoins.push({ code: invite.code, session_id: body.session_id, context });
+    const newMember = invite.guild.id === GUILD && leftServer;
+    if (newMember) rejoin();
+    const form = inviteForm;
+    inviteForm = false;
+    return json({ ...invite, new_member: newMember, show_verification_form: form });
   }
 
   if (method === "POST" && (m = path.match(/^\/channels\/(\d+)\/attachments$/))) {
@@ -4973,11 +5109,12 @@ const ENV_IDS = 1_450_000_000_000_000_000n;
  *  the account's own session and calls. The rest name the fixture's people
  *  and channels. */
 const GENERIC_CONTROLS = new Set([
-  "media-requests", "history", "forwards", "gif-selects", "nitro", "server-profile", "health", "presence", "logouts",
+  "media-requests", "history", "forwards", "gif-selects", "nitro", "profile", "profile-reset", "server-profile", "health", "presence", "logouts",
   "voice-identifies", "voice-changes", "call-audio", "call-video", "voice-link", "voice-drop", "voice-move",
   "stream-move", "sessions", "cookies", "list-requests", "audit-log", "slow", "gateway-reconnect", "qr-scan",
   "qr-confirm", "qr-captcha", "qr-cancel", "qr-expire", "voice-audio", "video", "stream-codec", "reactor-pages",
   "reactor-removals", "thread-searches", "thread-creates", "thread-members", "typed", "acks", "invites",
+  "invite-joins", "invite-captcha", "invite-form",
 ]);
 
 /** A status's emoji as the env gives it, Unicode or `<:name:id>`, as Discord sends it. */
@@ -5499,6 +5636,16 @@ const server = Bun.serve<SocketData>({
       dispatch("USER_UPDATE", { ...wireUser(users.alice), premium_type: nitro ? 2 : 0 });
       return new Response(nitro ? "Alice has Nitro\n" : "Alice has no Nitro\n");
     }
+    if (path === "/_control/profile") {
+      const { global_name, avatar } = users.alice;
+      return Response.json({ global_name, avatar, ...aliceProfile });
+    }
+    if (req.method === "POST" && path === "/_control/profile-reset") {
+      Object.assign(users.alice, { global_name: "Alice", avatar: "alice1" });
+      Object.assign(aliceProfile, { bio: "", pronouns: "", banner: null, accent_color: null });
+      dispatch("USER_UPDATE", { ...wireUser(users.alice), premium_type: nitro ? 2 : 0 });
+      return new Response("Alice's profile is as it started\n");
+    }
     if (path === "/_control/server-profile") {
       return Response.json({ nick: memberNicks.get(ALICE) ?? null, ...serverProfile(ALICE) });
     }
@@ -5999,19 +6146,20 @@ const server = Bun.serve<SocketData>({
     if (req.method === "GET" && path === "/_control/invites") {
       return Response.json(invites);
     }
+    if (req.method === "GET" && path === "/_control/invite-joins") {
+      return Response.json(inviteJoins);
+    }
+    if (req.method === "POST" && path === "/_control/invite-captcha") {
+      inviteCaptcha = true;
+      return new Response("the next join by an invite asks for a captcha\n");
+    }
+    if (req.method === "POST" && path === "/_control/invite-form") {
+      inviteForm = true;
+      return new Response("the next join by an invite has a form to fill in\n");
+    }
     if (req.method === "POST" && path === "/_control/rejoin") {
       if (!leftServer) return new Response("Alice is in Server\n", { status: 400 });
-      leftServer = false;
-      dispatch("GUILD_CREATE", {
-        ...guild(),
-        joined_at: new Date().toISOString(),
-        members: [member(users.alice)],
-        voice_states: [],
-        presences: [],
-        threads: [],
-        stage_instances: [],
-        guild_scheduled_events: [],
-      });
+      rejoin();
       return new Response("Alice joined Server again\n");
     }
     if (req.method === "POST" && path === "/_control/busy-start") {

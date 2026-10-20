@@ -16,7 +16,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use crate::{
     activity,
     api::{self, Api, PAGE, Span},
-    cache, forum, limits,
+    cache, forum, invite, limits,
     member_list::{ListedMember, Presence},
     message::{self, Message, Names, Page},
     notifications::Change,
@@ -497,6 +497,8 @@ enum Request {
     /// Nobody has used Yapfast since then, in Unix milliseconds, or someone
     /// is using it again; and whether it may show idle.
     Inactive(Option<u64>, bool),
+    /// This gateway session's id, from READY.
+    Session(oneshot::Sender<Option<String>>),
 }
 
 /// What a channel's dialog edits; see [`Discord::channel_settings`].
@@ -1126,14 +1128,17 @@ impl Discord {
         )
     }
 
-    /// This account's own profile in a server, for its per-server profile
-    /// editor, fetched afresh.
-    pub async fn server_profile(&self, guild: &str) -> Result<profile::ServerProfile> {
+    /// This account's own profile, for its editor, fetched afresh: in
+    /// `guild`, or its main one.
+    pub async fn own_profile(&self, guild: Option<&str>) -> Result<profile::OwnProfile> {
         let me = self.snapshots.borrow().user_id.clone();
         let me = me.ok_or_else(|| anyhow!("Discord hasn't said who this account is yet"))?;
-        let value = self.api.profile(&me, Some(guild)).await?;
-        profile::parse_server(&value, guild)
-            .ok_or_else(|| anyhow!("could not understand Discord's answer"))
+        let value = self.api.profile(&me, guild).await?;
+        match guild {
+            Some(guild) => profile::parse_server(&value, guild),
+            None => profile::parse_main(&value),
+        }
+        .ok_or_else(|| anyhow!("could not understand Discord's answer"))
     }
 
     /// Changes this account's profile in a server as Discord's client
@@ -1147,17 +1152,38 @@ impl Discord {
         member: &Value,
         profile: &Value,
     ) -> Result<()> {
-        let some = |body: &Value| body.as_object().is_some_and(|fields| !fields.is_empty());
         if some(member) {
             self.api.modify_member_me(guild, member).await?;
         }
         if some(profile) {
             self.api.modify_guild_profile(guild, profile).await?;
         }
-        let me = self.snapshots.borrow().user_id.clone();
-        self.lock_profiles()
-            .retain(|kept| kept.guild != guild || Some(&kept.user) != me.as_ref());
+        self.forget_own_profile(Some(guild));
         Ok(())
+    }
+
+    /// Changes this account's main profile as Discord's client does:
+    /// `user`'s fields, its display name and avatar, go to the user, then
+    /// `profile`'s, its bio, pronouns, banner and banner colour, to its
+    /// profile, each only when it has any. USER_UPDATE follows both.
+    pub async fn save_main_profile(&self, user: &Value, profile: &Value) -> Result<()> {
+        if some(user) {
+            self.api.modify_me(user).await?;
+        }
+        if some(profile) {
+            self.api.modify_profile_me(profile).await?;
+        }
+        self.forget_own_profile(None);
+        Ok(())
+    }
+
+    /// Drops this account's kept profiles, so they're fetched afresh: in
+    /// `guild`, or everywhere once the main profile changed.
+    fn forget_own_profile(&self, guild: Option<&str>) {
+        let me = self.snapshots.borrow().user_id.clone();
+        self.lock_profiles().retain(|kept| {
+            Some(&kept.user) != me.as_ref() || guild.is_some_and(|guild| kept.guild != guild)
+        });
     }
 
     fn lock_profiles(&self) -> std::sync::MutexGuard<'_, Vec<Kept>> {
@@ -1508,6 +1534,48 @@ impl Discord {
             .await?;
         self.write_names().learn_message(None, &sent);
         Ok(())
+    }
+
+    /// What an invite shows before joining by it, by its code; see
+    /// [`Api::resolve_invite`]. An invite that isn't to a server, which
+    /// Yapfast doesn't join, is refused.
+    pub async fn invite(&self, code: &str, typed: Option<&str>) -> Result<invite::Preview> {
+        let invite = self.api.resolve_invite(code, typed).await?;
+        invite::Preview::of(&invite).context("This invite isn't to a server.")
+    }
+
+    /// Joins a server by the invite `preview` shows, as Discord's client
+    /// does from `from`, showing each captcha Discord asks for first:
+    /// `captcha` hears its page's address. The server's GUILD_CREATE
+    /// follows, and a snapshot lists it.
+    pub async fn join_invite(
+        &self,
+        preview: &invite::Preview,
+        from: invite::JoinFrom,
+        captcha: impl FnMut(&str),
+    ) -> Result<invite::Joined> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .send(Request::Session(reply))
+            .map_err(|_| anyhow!("Discord isn't connected. Restart Yapfast and try again."))?;
+        let session = answer
+            .await
+            .ok()
+            .flatten()
+            .context("Discord isn't connected yet. Try again in a moment.")?;
+        let (api, session, context) = (&self.api, &session, &preview.context(from));
+        let answer = crate::captcha::solving(
+            |solved| async move {
+                let solved = solved
+                    .as_ref()
+                    .map(|(captcha, solution)| (captcha, solution.as_str()));
+                api.accept_invite(&preview.code, session, context, solved)
+                    .await
+            },
+            captcha,
+        )
+        .await?;
+        Ok(invite::Joined::of(&answer, preview))
     }
 
     /// A channel's name, topic, slowmode in seconds and whether it's
@@ -2199,6 +2267,11 @@ impl Discord {
 /// The server a channel is in, or none for DMs.
 fn server(guild: &str) -> Option<&str> {
     (guild != PRIVATE).then_some(guild)
+}
+
+/// Whether a request body has any fields to send.
+fn some(body: &Value) -> bool {
+    body.as_object().is_some_and(|fields| !fields.is_empty())
 }
 
 /// The status that silences notifications, as [`Snapshot::presence`] gives it.

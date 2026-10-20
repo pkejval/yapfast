@@ -14,6 +14,8 @@
   &nbsp;·&nbsp;
   <a href="https://yapfast.com">yapfast.com</a>
   &nbsp;·&nbsp;
+  <a href="https://yapfast.com/discord-invite">Discord server</a>
+  &nbsp;·&nbsp;
   <a href="#features">Features</a>
   &nbsp;·&nbsp;
   <a href="#build-it-yourself">Build it yourself</a>
@@ -49,10 +51,11 @@ you have. [How I measure](docs/measurements/README.md).
 
 It's a 0.1 beta, and it's what I use for Discord every day, so it had better
 be usable. Still, there are rough edges; when you hit one,
-[open an issue](https://github.com/yapfast/yapfast/issues) and I'll fix it. The
-connection drops every now and then (no more often than Vesktop's or the
-official app's does for me), and the noise suppression could be better. Know an
-open source one that does a better job? PLEASE tell me.
+[open an issue](https://github.com/yapfast/yapfast/issues) and I'll fix it, or
+come hang out on the [Yapfast Discord server](https://yapfast.com/discord-invite)
+and tell me there. The connection drops every now and then (no more often than
+Vesktop's or the official app's does for me), and the noise suppression could
+be better. Know an open source one that does a better job? PLEASE tell me.
 
 ## Will Discord ban me?
 
@@ -106,9 +109,10 @@ Advanced**.
 ### Linux
 
 It runs great on both X11 and Wayland, screen sharing too (Hyprland here).
-There's no package yet; an AppImage is coming, then the AUR. Until then, if you
-have [Nix](https://nixos.org), it's one command (pretty sure, anyway :D), and
-you get the same Discord-only app the releases ship, in your launcher:
+There's no package yet; an AppImage and an Arch package are coming with the
+next release. Until then, if you have [Nix](https://nixos.org), it's one
+command (pretty sure, anyway :D), and you get the same Discord-only app the
+releases ship, in your launcher:
 
 ```sh
 nix profile add github:yapfast/yapfast#yapfast
@@ -121,6 +125,21 @@ It compiles from source, so give it a few minutes. No Nix? Then
 
 Not yet, sorry :( I'd love to make one, but I don't own an Apple machine to
 test it on.
+
+### Nightly builds
+
+Want what's on `main` right now, without waiting for a release or building it
+yourself? Every now and then I put out a nightly build of the Discord-only app.
+They're on the [releases page](https://github.com/yapfast/yapfast/releases),
+marked **Pre-release**, newest first, each with a list of what changed:
+
+- **Windows:** the portable ZIP. Extract it and double-click `yapfast.exe`.
+- **Linux:** the AppImage, the one coming to releases too. `chmod +x` it and
+  run it.
+- **Arch Linux:** the `.pkg.tar.zst`, the one coming to releases too. Install
+  it with `sudo pacman -U` and the file or its link.
+
+They're untested between releases, so expect the odd rough edge.
 
 ## Features
 
@@ -155,7 +174,8 @@ test it on.
 - Running a server: make and edit channels and categories, invite people, hand
   out roles, change nicknames, time out, kick and ban. In voice, server mute,
   deafen and move people to another channel. Edit your server profile, and
-  leave. Folders show up as they do in Discord.
+  leave. Join a server by invite, from the + under your servers or a link in
+  chat. Folders show up as they do in Discord.
 - Notifications that follow your Discord settings, muting for channels,
   categories and servers, unread markers and member lists.
 - Ten themes, Catppuccin and Tokyo Night among them, and Bonfire, which is
@@ -168,13 +188,15 @@ test it on.
 - Media channels.
 - The soundboard.
 - Activities and server settings.
-- Making and changing server folders, and joining a server by invite.
+- Making and changing server folders.
+- A server's form for new members, such as its rules, when you join. Yapfast
+  sends you to Discord in your browser to fill it in.
 - A list of the people you blocked.
 - Leaving a group DM.
 - Animated custom emoji in messages, which show their first frame.
-- Captchas, sort of. If Discord asks for one while you link, Yapfast opens it
-  in your browser, but I haven't hit one against real Discord yet, so who
-  knows..
+- Captchas, sort of. If Discord asks for one while you link or join a server,
+  Yapfast opens it in your browser, but I haven't hit one against real
+  Discord yet, so who knows..
 
 Use Discord in a browser for these until then; it has all of it, and you have a
 browser open anyway. [The Discord plan](docs/discord.md) has the rest, in the

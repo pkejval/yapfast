@@ -1,0 +1,5 @@
+# makepkg works in this directory: keep only the PKGBUILDs.
+*
+!.gitignore
+!PKGBUILD
+!release.PKGBUILD

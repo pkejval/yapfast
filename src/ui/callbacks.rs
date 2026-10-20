@@ -466,6 +466,12 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
     bind!(on_close_add_friend, Action::CloseAddFriend);
     bind!(on_close_person, Action::ClosePersonDialog);
     bind!(on_close_invite, Action::CloseInvite);
+    bind!(on_open_join_server, Action::OpenJoinServer);
+    bind!(on_join_server, Action::JoinServer);
+    bind!(on_open_join_captcha, Action::OpenJoinCaptcha);
+    bind!(on_open_join_form, Action::OpenJoinForm);
+    bind!(on_close_join, Action::CloseJoin);
+    bind_item!(on_find_invite, Action::FindInvite);
     bind_item!(on_open_invite, Action::OpenInvite);
     {
         let adapter = adapter.clone();
@@ -489,8 +495,10 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
         });
     }
     bind!(on_close_channel, Action::CloseChannelDialog);
-    bind!(on_save_server_profile, Action::SaveServerProfile);
-    bind!(on_close_server_profile, Action::CloseServerProfile);
+    bind!(on_edit_profile, Action::EditProfile);
+    bind!(on_undo_profile, Action::UndoProfileEdits);
+    bind!(on_save_profile, Action::SaveProfile);
+    bind!(on_close_profile_editor, Action::CloseProfileEditor);
     bind!(on_unlock_nitro, Action::UnlockNitro);
     let profile_picture = |kind: i32| {
         if kind == 1 {
@@ -502,16 +510,17 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
     {
         let adapter = adapter.clone();
         let weak = window.as_weak();
-        window.on_write_server_profile(move |field, text| {
+        window.on_write_profile(move |field, text| {
             let field = match field {
-                0 => ProfileText::Nick,
+                0 => ProfileText::Name,
                 1 => ProfileText::Pronouns,
-                _ => ProfileText::Bio,
+                2 => ProfileText::Bio,
+                _ => ProfileText::Colour,
             };
             if let Some(window) = weak.upgrade() {
                 adapter.borrow_mut().action(
                     &window,
-                    Action::WriteServerProfile {
+                    Action::WriteProfile {
                         field,
                         text: text.into(),
                     },
@@ -1019,6 +1028,19 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
             state.borrow_mut().action(&window, action);
             return;
         }
+        // An invite to a Discord server shows the server, and joins only
+        // when asked, whatever the link's text says.
+        #[cfg(feature = "discord")]
+        if let Some(code) =
+            yapfast_core::discord::invite_code(links::masked(&link).unwrap_or(&link))
+        {
+            if let Some(window) = weak.upgrade() {
+                state
+                    .borrow_mut()
+                    .action(&window, Action::OpenInviteLink(code.to_owned()));
+            }
+            return;
+        }
         // A link whose text shows something else asks first.
         if let Some(masked) = links::masked(&link) {
             if let Some(window) = weak.upgrade() {
@@ -1407,6 +1429,14 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
     });
     window.on_selection_at(|x, y| {
         i_slint_core::yapfast_selection::copied_at(i_slint_core::lengths::LogicalPoint::new(x, y))
+            .unwrap_or_default()
+            .into()
+    });
+    window.on_link_at(|x, y| {
+        let point = i_slint_core::lengths::LogicalPoint::new(x, y);
+        i_slint_core::yapfast_selection::pressed_link_at(point)
+            .as_deref()
+            .and_then(web_address)
             .unwrap_or_default()
             .into()
     });
@@ -2497,6 +2527,13 @@ fn place_videos(adapter: &Adapter, window: &YapfastWindow) {
 
 /// Opens a web page in the browser. Only web pages open: a message can't
 /// start other programs.
+/// The web address a link in a message leads to: a masked link's, behind
+/// the question asked before leaving. A mention or Yapfast's own link has none.
+pub(super) fn web_address(link: &str) -> Option<&str> {
+    let link = links::masked(link).unwrap_or(link);
+    (links::openable(link) && mention::target(link).is_none()).then_some(link)
+}
+
 fn open_web_page(link: &str) {
     if links::openable(link) {
         super::browser::open(link);

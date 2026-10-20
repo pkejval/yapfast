@@ -24,22 +24,24 @@ mod forum;
 mod forward_places;
 mod gifs;
 mod header;
+mod join;
 mod members;
 mod messages;
 mod new_post;
 mod places;
 mod polls;
 mod preview;
+mod profile_editor;
 mod profiles;
 mod reactions;
 mod rooms;
 mod server;
-mod server_profile;
 mod session;
 mod threads;
 
 pub use forum::{ForumInfo, ForumPost, ForumPosts, ForumView};
 pub use gifs::{GifPicker, GifPicture, GifView};
+pub use join::JoinDialog;
 pub use members::{BAN_HISTORY, RoleChoice, TIMEOUT_TIMES};
 #[cfg(all(feature = "discord", any(test, feature = "test-fixtures")))]
 pub use members::{member_server, with_clubs};
@@ -51,11 +53,11 @@ pub use places::{
 pub use polls::{
     ANSWER_LIMIT, DraftAnswer, POLL_ANSWERS, POLL_HOURS, PollDraft, PollEdit, QUESTION_LIMIT,
 };
+pub use profile_editor::{
+    BIO_LIMIT, NAME_LIMIT, PRONOUNS_LIMIT, PictureEdit, ProfileEditor, ProfileText,
+};
 pub use reactions::{ReactionTip, ReactionsWindow, TIP_PEOPLE};
 pub use rooms::{MUTE_TIMES, MenuChoice, network_id, network_link};
-pub use server_profile::{
-    BIO_LIMIT, NICK_LIMIT, PRONOUNS_LIMIT, PictureEdit, ProfileText, ServerProfileEditor,
-};
 pub use threads::{
     NewThread, THREAD_NAME_LIMIT, ThreadFrom, ThreadList, ThreadSearch, ThreadSections,
     default_thread_name,
@@ -375,14 +377,16 @@ pub struct AppState {
     pub person_dialog: Option<PersonDialog>,
     /// The invite dialog of a Discord server or channel, while it's open.
     pub invite: Option<InviteDialog>,
+    /// Join a Server, while it's open.
+    pub join: Option<JoinDialog>,
     /// The dialog that makes, changes or deletes a Discord channel or
     /// category, while it's open.
     pub channel_dialog: Option<ChannelDialog>,
     /// Asks before leaving a Discord server, while it's open.
     pub leave: Option<LeaveDialog>,
-    /// The editor of this account's profile in a Discord server, while it's
-    /// open; its pictures go when it closes.
-    pub server_profile: Option<ServerProfileEditor>,
+    /// The editor of this account's Discord profile, its main one or one
+    /// server's, while it's open; its pictures go when it closes.
+    pub profile_editor: Option<ProfileEditor>,
     /// The same friends by name, as the friends list shows them.
     pub friends: Vec<chat::Friend>,
     pub friend_requests: Vec<chat::FriendRequest>,
@@ -1392,6 +1396,18 @@ pub enum Action {
         user: String,
         server: String,
     },
+    /// Open Join a Server; look up the invite in what was typed or pasted
+    /// into it; open it for a clicked invite link, by its code; join by
+    /// the invite it shows, or open the server for a member; open the
+    /// captcha Discord asked for again; open the server's form in the
+    /// browser; or close it.
+    OpenJoinServer,
+    FindInvite(String),
+    OpenInviteLink(String),
+    JoinServer,
+    OpenJoinCaptcha,
+    OpenJoinForm,
+    CloseJoin,
     /// Open the dialog that makes a channel of this kind, from a Discord
     /// server's menu, by its server id, or one like a channel in its
     /// category, from the channel's menu, by its room id.
@@ -1413,13 +1429,14 @@ pub enum Action {
     AskLeaveServer(String),
     LeaveServer,
     CloseLeaveServer,
-    /// Open the editor of this account's profile in a Discord server, by
-    /// its server id or one of its channels' room ids; change a text in it;
-    /// read a picture chosen for its avatar or banner; go back to the main
-    /// profile's; save what changed; open Discord's Nitro page, which the
-    /// avatar, banner and bio take; or close it.
+    /// Open the editor of this account's main Discord profile, or of its
+    /// profile in a Discord server, by its server id or one of its
+    /// channels' room ids; change a text in it; read a picture chosen for
+    /// its avatar or banner; go back to the fallback's; save what changed;
+    /// open Discord's Nitro page, which some fields take; or close it.
+    EditProfile,
     EditServerProfile(String),
-    WriteServerProfile {
+    WriteProfile {
         field: ProfileText,
         text: String,
     },
@@ -1428,9 +1445,11 @@ pub enum Action {
         path: PathBuf,
     },
     ResetProfilePicture(chat::ProfilePicture),
-    SaveServerProfile,
+    /// Undo every change in the profile editor, as its bar's Reset does.
+    UndoProfileEdits,
+    SaveProfile,
     UnlockNitro,
-    CloseServerProfile,
+    CloseProfileEditor,
     /// Change how the Discord account stands with someone. Unfriending and
     /// blocking ask first, through [`Action::AskPerson`].
     ChangeRelationship {
@@ -1724,15 +1743,15 @@ fn pictures_on_screen<'a>(
                 .filter(|_| state.dm_screen == Some(DmScreen::Friends))
                 .filter_map(|friend| friend.avatar.as_deref()),
         )
-        .chain(state.server_profile.iter().flat_map(|editor| {
-            // The server's pictures and the main profile's, which show where
-            // the server's are reset.
+        .chain(state.profile_editor.iter().flat_map(|editor| {
+            // The profile's pictures and its fallback's, which show where
+            // the profile's are reset.
             editor.profile.iter().flat_map(|profile| {
                 [
                     &profile.avatar,
                     &profile.banner,
-                    &profile.main.avatar,
-                    &profile.main.banner,
+                    &profile.fallback.avatar,
+                    &profile.fallback.banner,
                 ]
                 .into_iter()
                 .filter_map(Option::as_deref)
@@ -2284,6 +2303,16 @@ impl Application {
                 vec![]
             }
             Action::InviteToServer { user, server } => self.invite_to_server(user, server),
+            Action::OpenJoinServer => self.open_join(),
+            Action::FindInvite(typed) => self.find_invite(typed),
+            Action::OpenInviteLink(code) => self.open_invite_link(code),
+            Action::JoinServer => self.join_server(),
+            Action::OpenJoinCaptcha => self.open_join_captcha(),
+            Action::OpenJoinForm => self.open_join_form(),
+            Action::CloseJoin => {
+                self.state.join = None;
+                vec![]
+            }
             Action::NewChannel { place, kind } => self.new_channel(place, kind),
             Action::AskChannel(ask) => self.ask_channel(ask),
             Action::SaveChannel { kind, settings } => self.save_channel(kind, settings),
@@ -2297,9 +2326,10 @@ impl Application {
                 self.state.leave = None;
                 vec![]
             }
+            Action::EditProfile => self.edit_profile(),
             Action::EditServerProfile(place) => self.edit_server_profile(place),
-            Action::WriteServerProfile { field, text } => {
-                self.write_server_profile(field, text);
+            Action::WriteProfile { field, text } => {
+                self.write_profile(field, text);
                 vec![]
             }
             Action::PickProfilePicture { kind, path } => self.pick_profile_picture(kind, path),
@@ -2307,10 +2337,14 @@ impl Application {
                 self.reset_profile_picture(kind);
                 vec![]
             }
-            Action::SaveServerProfile => self.save_server_profile(),
+            Action::UndoProfileEdits => {
+                self.undo_profile_edits();
+                vec![]
+            }
+            Action::SaveProfile => self.save_profile(),
             Action::UnlockNitro => self.unlock_nitro(),
-            Action::CloseServerProfile => {
-                self.state.server_profile = None;
+            Action::CloseProfileEditor => {
+                self.state.profile_editor = None;
                 vec![]
             }
             Action::ChangeRelationship { user, change } => self.change_relationship(user, change),
@@ -2718,16 +2752,17 @@ impl Application {
             Event::GroupChanged(result) => self.group_changed(result),
             Event::InviteMade { room, result } => self.invite_made(room, result),
             Event::InviteSent { result, .. } => self.invite_sent(result),
+            Event::InviteResolved { code, result } => return self.invite_resolved(code, result),
+            Event::JoinCaptcha { code, page } => return self.join_captcha(code, page),
+            Event::ServerJoined { code, result } => return self.server_joined(code, result),
             Event::ChannelLoaded { room, result } => self.channel_loaded(room, result),
             Event::ChannelSaved(result) => self.channel_saved(result),
             Event::LeftServer { server, result } => self.left_server(server, result),
-            Event::ServerProfile { server, result } => self.server_profile_loaded(server, result),
+            Event::OwnProfile { server, result } => self.own_profile_loaded(server, result),
             Event::ProfilePicture { kind, path, result } => {
                 self.profile_picture_read(kind, path, result);
             }
-            Event::ServerProfileSaved { server, result } => {
-                self.server_profile_saved(server, result);
-            }
+            Event::ProfileSaved { server, result } => self.profile_saved(server, result),
             Event::FriendAdded(outcome) => {
                 if let Some(dialog) = &mut self.state.add_friend {
                     dialog.sending = false;

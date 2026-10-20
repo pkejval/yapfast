@@ -1670,6 +1670,38 @@ impl FavoriteGif {
     }
 }
 
+/// What an invite to a Discord server shows before joining by it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvitePreview {
+    pub code: String,
+    /// The server, by its server id, its name and the address of its icon.
+    pub server: String,
+    pub name: String,
+    pub icon: Option<String>,
+    /// The channel joining lands in, by its room id, its name, Discord's
+    /// type of it, which joining names, and whether it's a voice channel.
+    pub room: String,
+    pub channel: String,
+    pub channel_type: u64,
+    pub voice: bool,
+    /// How many members the server has, and how many are online, when
+    /// Discord counts them.
+    pub members: Option<u64>,
+    pub online: Option<u64>,
+}
+
+/// A Discord server joined by an invite.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JoinedServer {
+    /// The server, by its server id, and the channel the invite lands in,
+    /// by its room id.
+    pub server: String,
+    pub room: String,
+    /// Whether the server asks new members to fill in its form, such as
+    /// accepting its rules, before they may talk.
+    pub form: bool,
+}
+
 /// Commands only the linked Discord account carries out.
 #[derive(Clone)]
 pub enum DiscordCommand {
@@ -1873,6 +1905,22 @@ pub enum DiscordCommand {
         user: String,
         room: String,
     },
+    /// Look up an invite to a Discord server by its code, before joining
+    /// by it; `typed` is what someone typed into Join a Server, if they
+    /// did. [`Event::InviteResolved`] follows.
+    ResolveInvite {
+        code: String,
+        typed: Option<String>,
+    },
+    /// Join a Discord server by the invite `preview` shows, from Join a
+    /// Server, or from a clicked invite link with `from_link`.
+    /// [`Event::JoinCaptcha`] follows for each captcha Discord asks for
+    /// first, and then [`Event::ServerJoined`].
+    JoinServer {
+        // Boxed: it's the largest command by far.
+        preview: Box<InvitePreview>,
+        from_link: bool,
+    },
     /// Make a channel or category in a Discord server, by its server id,
     /// inside the category `parent` names by its room id, or a copy of
     /// `copy_of`'s channel, by its room id, with these settings;
@@ -1939,10 +1987,10 @@ pub enum DiscordCommand {
     /// Download server icons and avatars by address. Each that arrives comes
     /// back as [`Event::Picture`]; one that fails doesn't.
     Pictures(Vec<String>),
-    /// This account's profile in a Discord server, by its server id, for
-    /// its editor; [`Event::ServerProfile`] follows.
-    ServerProfile {
-        server: String,
+    /// This account's profile for its editor: in a Discord server, by its
+    /// server id, or its main profile; [`Event::OwnProfile`] follows.
+    OwnProfile {
+        server: Option<String>,
     },
     /// Read the picture at `path` for a profile, as Discord takes it, with
     /// a preview; [`Event::ProfilePicture`] follows.
@@ -1951,27 +1999,30 @@ pub enum DiscordCommand {
         path: PathBuf,
     },
     /// Change this account's profile in a Discord server, by its server
-    /// id; [`Event::ServerProfileSaved`] follows.
-    SaveServerProfile {
-        server: String,
-        change: Box<ServerProfileChange>,
+    /// id, or its main profile; [`Event::ProfileSaved`] follows.
+    SaveProfile {
+        server: Option<String>,
+        change: Box<ProfileChange>,
     },
 }
 
-/// This account's profile in a Discord server, as its editor shows it:
-/// what it set there, each empty where it goes by its main profile.
+/// This account's profile as its editor shows it, in a Discord server or
+/// its main one: what it set, each empty where it goes by `fallback`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ServerProfile {
-    pub nick: String,
+pub struct OwnProfile {
+    /// The server nickname, or the display name.
+    pub name: String,
     pub pronouns: String,
     pub bio: String,
-    /// The addresses of its server avatar and banner, when set; see
+    /// The addresses of its avatar and banner, when set; see
     /// [`DiscordCommand::Pictures`].
     pub avatar: Option<String>,
     pub banner: Option<String>,
-    /// Its main profile, whose name, pronouns, bio, avatar and banner show
-    /// where the server's are empty.
-    pub main: Profile,
+    /// The main profile's banner colour; a server has none of its own.
+    pub accent: Option<u32>,
+    /// What shows where a field is empty: in a server, the main profile;
+    /// in the main profile, the username and Discord's default avatar.
+    pub fallback: Profile,
 }
 
 /// A picture of a profile.
@@ -1990,16 +2041,19 @@ pub struct PickedPicture {
     pub preview: Arc<Picture>,
 }
 
-/// What changes in a profile in a Discord server: each field that does,
-/// a picture to `None` to go by the main profile's again, as an empty text
-/// does.
+/// What changes in this account's profile: each field that does, a
+/// picture to `None` to go by [`OwnProfile::fallback`] again, as an empty
+/// text does.
 #[derive(Clone, Debug, Default)]
-pub struct ServerProfileChange {
-    pub nick: Option<String>,
+pub struct ProfileChange {
+    /// The server nickname, or the display name.
+    pub name: Option<String>,
     pub pronouns: Option<String>,
     pub bio: Option<String>,
     pub avatar: Option<Option<PickedPicture>>,
     pub banner: Option<Option<PickedPicture>>,
+    /// The main profile's banner colour, `None` for Discord's default.
+    pub accent: Option<Option<u32>>,
 }
 
 /// A change to how the Discord account stands with someone.
@@ -2273,11 +2327,12 @@ pub enum Event {
     /// Whether Discord made, changed or deleted the channel a dialog asked
     /// it to: the room id of one it made, or why it didn't.
     ChannelSaved(Result<Option<String>, String>),
-    /// This account's profile in a Discord server, by its server id, as
-    /// [`DiscordCommand::ServerProfile`] asked, or why Discord didn't give it.
-    ServerProfile {
-        server: String,
-        result: Result<ServerProfile, String>,
+    /// This account's profile in a Discord server, by its server id, or
+    /// its main profile, as [`DiscordCommand::OwnProfile`] asked, or why
+    /// Discord didn't give it.
+    OwnProfile {
+        server: Option<String>,
+        result: Result<OwnProfile, String>,
     },
     /// The picture [`DiscordCommand::ProfilePicture`] read, from `path`, or
     /// why it can't be one.
@@ -2286,9 +2341,10 @@ pub enum Event {
         path: PathBuf,
         result: Result<PickedPicture, String>,
     },
-    /// Whether Discord took the change to a profile in a server, or why not.
-    ServerProfileSaved {
-        server: String,
+    /// Whether Discord took the change to this account's profile in a
+    /// server, or its main one, or why not.
+    ProfileSaved {
+        server: Option<String>,
         result: Result<(), String>,
     },
     /// Whether this account left a Discord server, by its server id, or why
@@ -2309,6 +2365,24 @@ pub enum Event {
         user: String,
         room: String,
         result: Result<(), String>,
+    },
+    /// What the invite [`DiscordCommand::ResolveInvite`] looked up by its
+    /// code shows, or why Discord showed nothing.
+    InviteResolved {
+        code: String,
+        result: Result<InvitePreview, String>,
+    },
+    /// The address of the page with a captcha Discord asked for before
+    /// joining by the invite with this code.
+    JoinCaptcha {
+        code: String,
+        page: String,
+    },
+    /// The server [`DiscordCommand::JoinServer`] joined by the invite with
+    /// this code, or why it didn't.
+    ServerJoined {
+        code: String,
+        result: Result<JoinedServer, String>,
     },
     /// The roles and groups a message in a room may mention.
     MentionGroups {
