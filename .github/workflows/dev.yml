@@ -1,0 +1,66 @@
+# Builds the fork's `dev` branch, upstream main with the open feature branches
+# merged (scripts/rebuild-dev), as an AppImage and a Flatpak bundle, and
+# publishes them as the rolling prerelease `dev-latest`.
+name: Dev build
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # The runner's preinstalled SDKs leave too little room for the build.
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v5
+        with:
+          # Nix refuses a shallow Git repository as a flake.
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ github.token }}
+      - id: version
+        run: |
+          current=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          IFS=. read -r major minor _ <<< "${current%%-*}"
+          echo "version=$major.$((minor + 1)).0-dev.$(date -u +%Y%m%d).$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"
+      - run: scripts/set-version "${{ steps.version.outputs.version }}"
+      - name: Fetch the toolchain and crates
+        run: nix develop path:./nix --command cargo fetch --locked
+      - run: scripts/build-appimage
+      - name: Install Flatpak
+        run: sudo apt-get install -y flatpak flatpak-builder
+      - run: scripts/build-flatpak
+      - name: Smoke-test the Flatpak
+        run: |
+          flatpak install --user -y --noninteractive target/dist/linux/Yapfast-*.flatpak
+          flatpak run io.github.yapfast.Yapfast --smoke-test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dev
+          path: |
+            target/dist/linux/Yapfast-*.AppImage
+            target/dist/linux/Yapfast-*.flatpak
+          if-no-files-found: error
+          compression-level: 0
+      - name: Publish dev-latest
+        run: |
+          gh release delete dev-latest --cleanup-tag --yes || true
+          gh release create dev-latest target/dist/linux/Yapfast-*.AppImage target/dist/linux/Yapfast-*.flatpak \
+            --prerelease --target "$GITHUB_SHA" \
+            --title "Yapfast dev (${GITHUB_SHA:0:7})" \
+            --notes "Upstream main with the open feature branches merged, built from $GITHUB_SHA. Install the bundle with \`flatpak install --user Yapfast-*.flatpak\`."

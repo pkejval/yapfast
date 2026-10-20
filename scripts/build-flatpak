@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Packs an AppImage's binary as a Flatpak bundle beside it:
+# `scripts/build-flatpak [APPIMAGE]`, by default the AppImage of Cargo.toml's
+# version in target/dist/linux. Needs flatpak and flatpak-builder, and
+# Flathub's runtime, which it installs for the user.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+if (($# > 1)); then
+  echo "usage: scripts/build-flatpak [APPIMAGE]" >&2
+  exit 2
+fi
+if (($#)); then
+  appimage=$1
+else
+  current=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+  appimage=target/dist/linux/Yapfast-$current-x86_64.AppImage
+fi
+if [[ ! -f $appimage ]]; then
+  echo "scripts/build-flatpak: no $appimage; run scripts/build-appimage first" >&2
+  exit 2
+fi
+output=$(cd "$(dirname "$appimage")" && pwd)
+bundle=$output/$(basename "${appimage%-x86_64.AppImage}")-x86_64.flatpak
+work=target/flatpak
+rm -rf "$work"
+mkdir -p "$work"
+# The runtime unpacks its filesystem without FUSE.
+(cd "$work" && "$OLDPWD/$appimage" --appimage-extract >/dev/null)
+flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak-builder --user --force-clean --install-deps-from=flathub \
+  --repo="$work/repo" "$work/build" packaging/flatpak/io.github.yapfast.Yapfast.yml
+flatpak build-bundle "$work/repo" "$bundle" io.github.yapfast.Yapfast
+echo "Packaged $bundle ($(du -m "$bundle" | cut -f1) MiB)"
