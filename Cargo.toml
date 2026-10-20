@@ -193,3 +193,12 @@ inherits = "measure"
 
 [profile.fast.package.yapfast-ui]
 opt-level = 0
+
+# Release without the Slint interface's optimization, for the fork's dev
+# build (.github/workflows/dev.yml), which tries features and measures nothing:
+# yapfast-ui is most of what a change recompiles.
+[profile.dev-ci]
+inherits = "release"
+
+[profile.dev-ci.package.yapfast-ui]
+opt-level = 0

@@ -20,6 +20,12 @@
         yapfast = import ./nix/package.nix { inherit pkgs; };
         # The AppDir and runtime scripts/package-linux.py packs into the AppImage.
         appdir = import ./nix/appimage.nix { inherit pkgs yapfast; };
+        # The same with a binary cargo built outside the sandbox, named by
+        # $YAPFAST_BINARY (`nix build --impure`): scripts/package-linux.py --binary.
+        appdir-prebuilt = import ./nix/appimage.nix {
+          inherit pkgs;
+          yapfast = import ./nix/prebuilt.nix { inherit pkgs; binary = /. + builtins.getEnv "YAPFAST_BINARY"; };
+        };
         default = yapfast;
       };
     };
