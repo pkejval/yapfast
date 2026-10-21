@@ -23,6 +23,11 @@ start=$(git branch --show-current)
 
 branches=()
 for branch in $(git for-each-ref --format='%(refname:short)' refs/heads/pr refs/heads/local); do
+  # A squash-merged PR leaves no patch for the rebase to drop, so ask GitHub.
+  if [[ $branch == pr/* ]] && command -v gh >/dev/null 2>&1     && [[ $(gh pr list -R yapfast/yapfast --head "$branch" --state merged --json number --jq length 2>/dev/null || echo 0) -gt 0 ]]; then
+    echo "$branch was merged upstream: delete it"
+    continue
+  fi
   git checkout --quiet "$branch"
   if ! git rebase --quiet upstream/main; then
     echo "scripts/rebuild-dev: $branch conflicts with upstream/main; resolve it, git rebase --continue, rerun" >&2
