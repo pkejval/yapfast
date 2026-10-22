@@ -42,7 +42,7 @@ done
 
 git checkout --quiet -B dev upstream/main
 for branch in "${branches[@]}"; do
-  if ! git merge --quiet --no-ff -m "Merge $branch into dev" "$branch"; then
+  if ! git merge --quiet --no-ff -m "Merge $branch into dev" "$branch"     && { [[ -n $(git rerere remaining) ]] || ! git commit --quiet -a --no-edit; }; then
     echo "scripts/rebuild-dev: $branch conflicts with the branches before it in dev" >&2
     echo "resolve it, commit, and the result stays; rerere remembers it for the next run" >&2
     exit 1
