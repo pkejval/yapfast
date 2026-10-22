@@ -17,6 +17,8 @@ finish-args:
   - --talk-name=org.kde.StatusNotifierWatcher
   - --own-name=org.kde.*
   - --talk-name=org.freedesktop.Notifications
+  # The credential store: the keyring crate reaches Secret Service directly.
+  - --talk-name=org.freedesktop.secrets
   # Rich Presence from games, over Discord's IPC socket.
   - --filesystem=xdg-run/discord-ipc-0
   - --filesystem=xdg-run/discord-ipc-1
