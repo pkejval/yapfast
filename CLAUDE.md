@@ -37,7 +37,7 @@
   needless copy you find on that path, or report it. Targets, and how to
   measure: `docs/measurements/README.md`. A commit that saves memory gives
   the numbers it measured.
-- Start new branches from `origin/main` after `git fetch`.
+- Start new branches from `upstream/main` after `git fetch upstream`.
 - Every feature or fix is its own branch from `upstream/main`: `pr/*` for what
   goes upstream, `local/*` for what stays in the fork (CI, packaging, this
   file). Never commit to `dev`: `scripts/rebuild-dev` resets it to
