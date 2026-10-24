@@ -1,0 +1,119 @@
+# Builds the fork's `dev` branch, upstream main with the open feature branches
+# merged (scripts/rebuild-dev), as an AppImage and a Flatpak bundle, and
+# publishes them as the rolling prerelease `dev-latest`.
+#
+# Built for repeat speed: Nix supplies only the environment (its store is
+# cached), and cargo compiles outside Nix's sandbox, where the compiled
+# dependencies in target/ are cached, so a push compiles only what it changed.
+# The releases still build in the sandbox (nightly.yml).
+name: Dev build
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # Two slow chores run beside the steps that follow, which don't need
+      # them: the runner's preinstalled SDKs leave too little room for the
+      # build (deleting them took 90 s in a step of its own), and the Flatpak
+      # tools are for the last steps. The last steps wait for the second.
+      - name: Free disk space and install Flatpak in the background
+        run: |
+          nohup sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL >/dev/null 2>&1 &
+          nohup sh -c 'sudo apt-get install -y flatpak flatpak-builder >/tmp/apt.log 2>&1; touch /tmp/apt-done' >/dev/null 2>&1 &
+      - uses: actions/checkout@v5
+        with:
+          # Nix refuses a shallow Git repository as a flake.
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ github.token }}
+      # No cache of Nix's store: the shell downloads in under a minute from
+      # cache.nixos.org, which a restore (and the save after it) takes as long
+      # as. rustup's download of the pinned toolchain is cached.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.rustup
+          key: rustup-${{ hashFiles('rust-toolchain.toml') }}
+      # The compiled dependencies, before scripts/set-version changes
+      # Cargo.lock, so a new version doesn't recompile them. A changed
+      # Cargo.lock restores the nearest older cache and compiles the difference.
+      # A cache is saved once per key, so the key also names what the C and
+      # C++ dependencies were compiled with, or an old cache would stay
+      # in use, and its dependencies recompile on every run.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: ${{ hashFiles('.github/workflows/dev.yml', 'nix/flake.nix', 'nix/flake.lock', 'nix/native.nix') }}
+      - id: version
+        run: |
+          current=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          IFS=. read -r major minor _ <<< "${current%%-*}"
+          echo "version=$major.$((minor + 1)).0-dev.$(date -u +%Y%m%d).$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"
+      - run: scripts/set-version "${{ steps.version.outputs.version }}"
+      - name: Fetch the toolchain and crates
+        run: nix develop path:./nix --command cargo fetch --locked
+      # Paths remapped, as in Nix's sandbox: the binary may not name the
+      # runner's home, which scripts/package-linux.py checks. mold links the
+      # large binary faster than the default linker.
+      - name: Build
+        run: |
+          export RUSTFLAGS="--remap-path-prefix=$HOME=/home/build --remap-path-prefix=$PWD=/build/src -C link-arg=-fuse-ld=mold"
+          # The same for the C and C++ the crates compile (__FILE__, assertions).
+          export CFLAGS="-ffile-prefix-map=$HOME=/home/build -ffile-prefix-map=$PWD=/build/src"
+          export CXXFLAGS="$CFLAGS"
+          nix develop path:./nix --command cargo build --profile dev-ci --locked \
+            --no-default-features --features desktop,discord
+          # nix develop's $out is $PWD/outputs/out; the linker wrapper writes its lib
+          # folder into the RUNPATH. The AppImage drops the RUNPATH, but patchelf leaves
+          # its string behind, so overwrite it with a path of the same length.
+          python3 -c 'import sys; p, o = sys.argv[1:]; d = open(p, "rb").read(); n = o.encode(); open(p, "wb").write(d.replace(n, b"/" + b"x" * (len(n) - 1)))' \
+            target/dev-ci/yapfast "$PWD/outputs/out/lib"
+          # Where the runner's home is still named, if anywhere.
+          grep -a -o "[ -~]*$HOME[ -~]*" target/dev-ci/yapfast | sort | uniq -c | sort -rn | head -40 || true
+      # A lower compression than the releases': this AppImage is for testing.
+      - run: scripts/build-appimage --binary target/dev-ci/yapfast --zstd-level 3
+      - name: Wait for the Flatpak tools
+        run: |
+          while [ ! -e /tmp/apt-done ]; do sleep 1; done
+          command -v flatpak-builder || { cat /tmp/apt.log; exit 1; }
+      # Flathub's runtime and SDK, which scripts/build-flatpak installs.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.local/share/flatpak
+          key: flatpak-${{ hashFiles('packaging/flatpak/*.yml') }}
+      - run: scripts/build-flatpak
+      - name: Smoke-test the Flatpak
+        run: |
+          flatpak install --user -y --noninteractive target/dist/linux/Yapfast-*.flatpak
+          flatpak run io.github.yapfast.Yapfast --smoke-test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dev
+          path: |
+            target/dist/linux/Yapfast-*.AppImage
+            target/dist/linux/Yapfast-*.flatpak
+          if-no-files-found: error
+          compression-level: 0
+      - name: Publish dev-latest
+        run: |
+          gh release delete dev-latest --cleanup-tag --yes || true
+          gh release create dev-latest target/dist/linux/Yapfast-*.AppImage target/dist/linux/Yapfast-*.flatpak \
+            --prerelease --target "$GITHUB_SHA" \
+            --title "Yapfast dev (${GITHUB_SHA:0:7})" \
+            --notes "Upstream main with the open feature branches merged, built from $GITHUB_SHA. Install the bundle with \`flatpak install --user Yapfast-*.flatpak\`."
