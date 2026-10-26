@@ -4,7 +4,9 @@ the dependencies' licenses and notices added, packed behind the AppImage
 runtime. Beside it go the .zsync file AppImageUpdate reads, which the release
 must carry too, and the source snapshot.
 
-scripts/build-appimage runs it inside the development shell."""
+scripts/build-appimage runs it inside the development shell. With --binary it
+packs a binary cargo built there, instead of Nix building one in its sandbox:
+the dev build caches cargo's target folder, which the sandbox can't."""
 import argparse
 import json
 import os
@@ -12,30 +14,48 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.parse
 
 from release_package import ROOT, dependency_notices, digest, names_home, source_snapshot
+
+STARTED = time.monotonic()
+
+
+def step(name):
+    """Prints how long the packing has run, to show where a slow build waits."""
+    print(f"[{time.monotonic() - STARTED:7.1f} s] {name}", flush=True)
+
 
 TARGET = "x86_64-unknown-linux-gnu"
 FEATURES = ["--no-default-features", "--features", "desktop,discord"]
 
 
-def nix_build(installable):
-    return Path(subprocess.check_output(["nix", "build", "--no-link", "--print-out-paths", installable],
-                                        cwd=ROOT, text=True, timeout=7200).strip())
+def nix_build(installable, *options, **environment):
+    return Path(subprocess.check_output(["nix", "build", "--no-link", "--print-out-paths", *options, installable],
+                                        cwd=ROOT, text=True, timeout=7200,
+                                        env={**os.environ, **environment}).strip())
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "target/dist/linux")
+    parser.add_argument("--zstd-level", type=int, default=19, help="the filesystem's compression; lower packs faster")
+    parser.add_argument("--binary", type=Path, help="a stripped release binary built in the development shell")
     args = parser.parse_args()
     # The flake sees only files Git tracks; a new one must be added first.
-    parts = nix_build(".#appdir")
+    if args.binary:
+        parts = nix_build(".#appdir-prebuilt", "--impure", YAPFAST_BINARY=str(args.binary.resolve()))
+    else:
+        parts = nix_build(".#appdir")
+    step("AppDir built")
     skia_source = nix_build("path:./nix#skia-source")
+    step("Skia source fetched")
     metadata = json.loads(subprocess.check_output(
         ["cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", TARGET, *FEATURES],
         cwd=ROOT, timeout=30,
     ))
+    step("cargo metadata")
     version = next(package["version"] for package in metadata["packages"] if package["name"] == "yapfast")
     skia_url = urllib.parse.urlparse(os.environ["SKIA_BINARIES_URL"])
     if skia_url.scheme != "file":
@@ -61,7 +81,7 @@ def main():
         executable = appdir / "usr/bin/yapfast"
         contents = executable.read_bytes()
         if names_home(contents):
-            raise SystemExit(f"{executable} names {Path.home()}; it should come from the Nix build")
+            raise SystemExit(f"{executable} names {Path.home()}; it should be built with its paths remapped")
         del contents
 
         doc = appdir / "usr/share/doc/yapfast"
@@ -75,13 +95,15 @@ def main():
             "holds every dependency's own license and notices.\n",
             encoding="utf-8",
         )
+        step("source snapshot zipped")
         dependencies = dependency_notices(metadata, doc, doc / "licenses", skia_archive, skia_source, webrtc)
+        step("dependency notices copied")
         (doc / "THIRD-PARTY.json").write_text(json.dumps(dependencies, indent=2) + "\n", encoding="utf-8")
         lock = json.loads((ROOT / "flake.lock").read_text())["nodes"]["nixpkgs"]["locked"]
         build = {
             "version": version, "flavour": "discord", "target": TARGET,
             "cargo_features": " ".join(FEATURES),
-            "built_by": "nix build .#appdir",
+            "built_by": "nix build .#appdir-prebuilt" if args.binary else "nix build .#appdir",
             "nixpkgs_revision": lock["rev"],
             "ui_framework": "Slint 1.18.1",
             "skia_version": "0.153.3",
@@ -100,8 +122,9 @@ def main():
         environment = {name: value for name, value in os.environ.items() if name != "SOURCE_DATE_EPOCH"}
         subprocess.run(["mksquashfs", appdir, filesystem, "-noappend", "-quiet", "-no-progress",
                         "-root-owned", "-no-xattrs", "-mkfs-time", "0", "-all-time", "0",
-                        "-comp", "zstd", "-Xcompression-level", "19", "-b", "1M"],
+                        "-comp", "zstd", "-Xcompression-level", str(args.zstd_level), "-b", "1M"],
                        env=environment, check=True, timeout=1800)
+        step("filesystem squashed")
         with image.open("wb") as stream:
             for part in (parts / "runtime", filesystem):
                 with part.open("rb") as piece:
@@ -117,6 +140,7 @@ def main():
     zsync = output / f"{image.name}.zsync"
     subprocess.run(["zsyncmake", "-u", image.name, "-o", zsync, image], check=True, timeout=600,
                    stdout=subprocess.DEVNULL)
+    step("zsync made")
     hashes = output / "SHA256SUMS.txt"
     artifacts = [image, zsync, source_path]
     hashes.write_text("".join(f"{digest(path)}  {path.name}\n" for path in artifacts), encoding="utf-8")

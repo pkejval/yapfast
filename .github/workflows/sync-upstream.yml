@@ -1,0 +1,53 @@
+# Keeps the fork's `dev` branch current: when upstream's main has a commit
+# origin/main lacks, runs scripts/rebuild-dev --push, which rebases every pr/*
+# and local/* branch onto upstream/main and rebuilds `dev` from them. The push
+# to `dev` starts dev.yml.
+#
+# GitHub cannot trigger a workflow from another repository's push, so this
+# polls. A schedule runs only from the default branch, so the default branch
+# must be `dev` (it carries this file through local/fork-tooling); `main`
+# is reset to upstream/main on every sync and would lose it.
+#
+# Secret SYNC_TOKEN: a personal access token with `repo` and `workflow` scope.
+# The built-in token may not push a change to .github/workflows, and a push
+# made with it starts no other workflow, so dev.yml would not run.
+# A rebase or merge that conflicts fails the run; resolve it locally with
+# scripts/rebuild-dev --push.
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+      - name: Rebuild dev if upstream moved
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git remote add upstream https://github.com/yapfast/yapfast.git
+          git fetch --quiet upstream
+          if [[ $(git rev-parse upstream/main) == $(git rev-parse origin/main) ]]; then
+            echo "origin/main already at upstream/main"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for branch in $(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin/pr refs/remotes/origin/local); do
+            git branch --track "$branch" "origin/$branch"
+          done
+          scripts/rebuild-dev --push
