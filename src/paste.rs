@@ -17,7 +17,7 @@ pub enum Clipboard {
 }
 
 /// Picture types Discord shows inline, best first, with their extensions.
-const PICTURES: [(&str, &str); 4] = [
+pub const PICTURES: [(&str, &str); 4] = [
     ("image/png", "png"),
     ("image/gif", "gif"),
     ("image/webp", "webp"),
@@ -27,6 +27,16 @@ const PICTURES: [(&str, &str); 4] = [
 /// Reads the clipboard. Blocks while the copying app sends its data, so it
 /// runs off the UI thread; Yapfast itself may be that app.
 pub fn read() -> Clipboard {
+    // The selection the compositor announced to Yapfast's own data device
+    // needs no privileged protocol, so it works in a sandbox too.
+    #[cfg(target_os = "linux")]
+    if let Some(kinds) = crate::drop::wayland::clipboard_kinds() {
+        let read = pick(
+            |kind| kinds.iter().any(|offered| *offered == kind),
+            |kind| crate::drop::wayland::read_clipboard(kind).ok_or(()),
+        );
+        return read.unwrap_or(Clipboard::Other);
+    }
     #[cfg(target_os = "linux")]
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         match wayland::read() {
@@ -73,7 +83,7 @@ mod wayland {
 
     use wl_clipboard_rs::paste::{ClipboardType, Error, MimeType, Seat, get_contents};
 
-    use super::{Clipboard, PICTURES, files};
+    use super::{Clipboard, pick};
 
     pub fn read() -> Result<Clipboard, Error> {
         let types =
@@ -83,30 +93,43 @@ mod wayland {
                 Err(Error::ClipboardEmpty | Error::NoMimeType) => return Ok(Clipboard::Other),
                 Err(error) => return Err(error),
             };
-        let contents = |kind: &str| -> Result<Vec<u8>, Error> {
-            let (mut pipe, _) = get_contents(
-                ClipboardType::Regular,
-                Seat::Unspecified,
-                MimeType::Specific(kind),
-            )?;
-            let mut bytes = Vec::new();
-            pipe.read_to_end(&mut bytes).map_err(Error::PipeCreation)?;
-            Ok(bytes)
-        };
-        if types.contains("text/uri-list") {
-            let list = contents("text/uri-list")?;
-            let found = files(&String::from_utf8_lossy(&list));
-            if !found.is_empty() {
-                return Ok(Clipboard::Files(found));
-            }
-        }
-        for (kind, extension) in PICTURES {
-            if types.contains(kind) {
-                return Ok(Clipboard::Picture(contents(kind)?, extension));
-            }
-        }
-        Ok(Clipboard::Other)
+        pick(
+            |kind| types.contains(kind),
+            |kind| {
+                let (mut pipe, _) = get_contents(
+                    ClipboardType::Regular,
+                    Seat::Unspecified,
+                    MimeType::Specific(kind),
+                )?;
+                let mut bytes = Vec::new();
+                pipe.read_to_end(&mut bytes).map_err(Error::PipeCreation)?;
+                Ok(bytes)
+            },
+        )
     }
+}
+
+/// What the clipboard holds that Yapfast attaches: files first, then the
+/// first picture type it offers. `offers` says what's on the clipboard and
+/// `contents` reads one type of it.
+#[cfg(target_os = "linux")]
+fn pick<E>(
+    offers: impl Fn(&str) -> bool,
+    contents: impl Fn(&str) -> Result<Vec<u8>, E>,
+) -> Result<Clipboard, E> {
+    if offers("text/uri-list") {
+        let list = contents("text/uri-list")?;
+        let found = files(&String::from_utf8_lossy(&list));
+        if !found.is_empty() {
+            return Ok(Clipboard::Files(found));
+        }
+    }
+    for (kind, extension) in PICTURES {
+        if offers(kind) {
+            return Ok(Clipboard::Picture(contents(kind)?, extension));
+        }
+    }
+    Ok(Clipboard::Other)
 }
 
 /// The existing local files a `text/uri-list` names.
