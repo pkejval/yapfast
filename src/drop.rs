@@ -105,7 +105,8 @@ pub mod wayland {
     //! window, so a window made again needs nothing new.
 
     use std::io::Read;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::os::fd::AsFd;
+    use std::sync::{Mutex, PoisonError};
 
     use wayland_client::protocol::wl_data_device::{self, WlDataDevice};
     use wayland_client::protocol::wl_data_device_manager::{DndAction, WlDataDeviceManager};
@@ -115,8 +116,51 @@ pub mod wayland {
     use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, event_created_child};
 
     use super::Drag;
+    use crate::paste::PICTURES;
 
     const URI_LIST: &str = "text/uri-list";
+
+    /// The clipboard as the compositor last announced it to this client: not
+    /// yet, empty, or an offer. A sandbox such as Flatpak's may not see the
+    /// data-control protocol, which the clipboard is otherwise read through,
+    /// but a client always gets the selection while its window has focus.
+    static SELECTION: Mutex<Option<Option<Held>>> = Mutex::new(None);
+
+    struct Held {
+        offer: WlDataOffer,
+        /// The offered types Yapfast takes: files and pictures.
+        kinds: Vec<&'static str>,
+        connection: Connection,
+    }
+
+    /// The types Yapfast takes that the clipboard offers, or `None` while the
+    /// compositor hasn't announced the clipboard to this client yet.
+    pub fn clipboard_kinds() -> Option<Vec<&'static str>> {
+        let held = SELECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        let held = held.as_ref()?;
+        Some(held.as_ref().map_or_else(Vec::new, |held| held.kinds.clone()))
+    }
+
+    /// The clipboard's contents as `kind`, read as the copying app sends them.
+    /// Blocks until it has, so it runs off the UI thread.
+    pub fn read_clipboard(kind: &str) -> Option<Vec<u8>> {
+        let (mut reader, writer) = std::io::pipe().ok()?;
+        {
+            // The lock keeps the dispatching thread from destroying the offer
+            // between the check and the request.
+            let held = SELECTION.lock().unwrap_or_else(PoisonError::into_inner);
+            let held = held.as_ref()?.as_ref()?;
+            if !held.kinds.iter().any(|offered| *offered == kind) {
+                return None;
+            }
+            held.offer.receive(kind.into(), writer.as_fd());
+            held.connection.flush().ok()?;
+        }
+        drop(writer);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).ok()?;
+        Some(bytes)
+    }
 
     /// Watches for files dragged over Yapfast's windows on the connection whose
     /// `wl_display` this is, reporting each step to `report` from a thread.
@@ -177,9 +221,19 @@ pub mod wayland {
         left: Option<WlDataOffer>,
     }
 
-    /// Whether an offer holds files.
+    /// The types an offer lists that Yapfast takes.
     #[derive(Default)]
-    struct Offered(AtomicBool);
+    struct Offered(Mutex<Vec<&'static str>>);
+
+    impl Offered {
+        fn kinds(&self) -> Vec<&'static str> {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        }
+
+        fn files(&self) -> bool {
+            self.kinds().contains(&URI_LIST)
+        }
+    }
 
     impl Dispatch<WlRegistry, ()> for State {
         fn event(
@@ -231,9 +285,7 @@ pub mod wayland {
                     id: Some(offer),
                     ..
                 } => {
-                    let files = offer
-                        .data::<Offered>()
-                        .is_some_and(|offered| offered.0.load(Ordering::Relaxed));
+                    let files = offer.data::<Offered>().is_some_and(Offered::files);
                     if files {
                         offer.accept(serial, Some(URI_LIST.into()));
                         if offer.version() >= 3 {
@@ -278,8 +330,23 @@ pub mod wayland {
                         }
                     }
                 }
-                // The clipboard's offers: Yapfast reads the clipboard elsewhere.
-                wl_data_device::Event::Selection { id: Some(offer) } => offer.destroy(),
+                wl_data_device::Event::Selection { id } => {
+                    let held = id.map(|offer| Held {
+                        kinds: offer
+                            .data::<Offered>()
+                            .map(Offered::kinds)
+                            .unwrap_or_default(),
+                        offer,
+                        connection: state.connection.clone(),
+                    });
+                    let old = SELECTION
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .replace(held);
+                    if let Some(Some(old)) = old {
+                        old.offer.destroy();
+                    }
+                }
                 _ => {}
             }
         }
@@ -323,9 +390,15 @@ pub mod wayland {
             _: &QueueHandle<Self>,
         ) {
             if let wl_data_offer::Event::Offer { mime_type } = event
-                && mime_type == URI_LIST
+                && let Some(kind) = std::iter::once(URI_LIST)
+                    .chain(PICTURES.iter().map(|(kind, _)| *kind))
+                    .find(|kind| *kind == mime_type)
             {
-                offered.0.store(true, Ordering::Relaxed);
+                offered
+                    .0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(kind);
             }
         }
     }
