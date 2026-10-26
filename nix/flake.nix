@@ -67,11 +67,7 @@
       devShells.${system} = {
         default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [
-<<<<<<< HEAD
-            rustup pkg-config cmake ninja mold llvmPackages_21.clang
-=======
-            rustup pkg-config cmake ninja llvmPackages_21.clang llvmPackages_21.libclang
->>>>>>> pr/lottie-stickers
+            rustup pkg-config cmake ninja mold llvmPackages_21.clang llvmPackages_21.libclang
             protobuf curl jq docker-compose python3 llvmPackages_21.llvm
             # pasta, nftables and iproute2 isolate one voice test participant's network.
             passt nftables iproute2
